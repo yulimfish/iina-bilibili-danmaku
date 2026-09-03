@@ -64,19 +64,18 @@
 
 <div id="tab-settings" class="hidden">
   <div class="section-title">② 弹幕控制</div>
-  <!-- TODO(M4): wire all controls -->
-  <label class="opt"><input type="checkbox" checked disabled> 显示弹幕</label>
-  <label class="opt"><input type="checkbox" checked disabled> 顶部弹幕</label>
-  <label class="opt"><input type="checkbox" checked disabled> 底部弹幕</label>
-  <label class="opt">字号 <input type="range" min="18" max="36" value="25" disabled></label>
-  <label class="opt">透明度 <input type="range" min="0" max="100" value="100" disabled></label>
-  <label class="opt">速度 <input type="range" min="200" max="1200" value="680" disabled></label>
-  <label class="opt">偏移 <input type="range" min="-30" max="30" value="0" disabled></label>
+  <!-- M4: all controls live -->
+  <label class="opt"><input type="checkbox" id="set-enabled" checked> 显示弹幕</label>
+  <label class="opt"><input type="checkbox" id="set-top" checked> 顶部弹幕</label>
+  <label class="opt"><input type="checkbox" id="set-bottom" checked> 底部弹幕</label>
+  <label class="opt">字号 <span id="val-fontsize">25</span><input type="range" id="set-fontsize" min="18" max="36" value="25"></label>
+  <label class="opt">透明度 <span id="val-opacity">100</span><input type="range" id="set-opacity" min="0" max="100" value="100"></label>
+  <label class="opt">速度 <span id="val-speed">680</span><input type="range" id="set-speed" min="200" max="1200" value="680"></label>
+  <label class="opt">偏移 <span id="val-offset">0s</span><input type="range" id="set-offset" min="-30" max="30" value="0"></label>
   <div class="row">
-    <button class="action" disabled>清空弹幕</button>
-    <button class="action" disabled>重置偏移</button>
+    <button class="action" id="clear-btn">清空弹幕</button>
+    <button class="action" id="reset-offset-btn">重置偏移</button>
   </div>
-  <div class="hint">M1 骨架：面板可开可关，控件暂不可用。</div>
 </div>
 
 <script>
@@ -182,6 +181,69 @@
       setStatus("未加载", false);
     }
   });
+
+  // M4: settings controls.
+  const ctl = {
+    enabled: document.getElementById("set-enabled"),
+    showTop: document.getElementById("set-top"),
+    showBottom: document.getElementById("set-bottom"),
+    fontSize: document.getElementById("set-fontsize"),
+    opacity: document.getElementById("set-opacity"),
+    speed: document.getElementById("set-speed"),
+    offset: document.getElementById("set-offset")
+  };
+
+  function patchFromUI() {
+    return {
+      enabled: ctl.enabled.checked,
+      showTop: ctl.showTop.checked,
+      showBottom: ctl.showBottom.checked,
+      fontSize: parseInt(ctl.fontSize.value, 10),
+      opacity: parseInt(ctl.opacity.value, 10),
+      speed: parseInt(ctl.speed.value, 10),
+      offset: parseInt(ctl.offset.value, 10)
+    };
+  }
+
+  function refreshValueLabels() {
+    document.getElementById("val-fontsize").textContent = ctl.fontSize.value;
+    document.getElementById("val-opacity").textContent = ctl.opacity.value;
+    document.getElementById("val-speed").textContent = ctl.speed.value;
+    document.getElementById("val-offset").textContent = ctl.offset.value + "s";
+  }
+
+  Object.keys(ctl).forEach((k) => {
+    ctl[k].onchange = () => {
+      refreshValueLabels();
+      const patch = {};
+      patch[k] = patchFromUI()[k];
+      iina.postMessage("update-settings", { patch: patch });
+    };
+  });
+  refreshValueLabels();
+
+  document.getElementById("clear-btn").onclick = () => {
+    iina.postMessage("clear-danmaku", {});
+  };
+  document.getElementById("reset-offset-btn").onclick = () => {
+    iina.postMessage("update-settings", { patch: { offset: 0 } });
+  };
+
+  iina.onMessage("settings", (data) => {
+    if (!data || !data.settings) {
+      return;
+    }
+    const s = data.settings;
+    ctl.enabled.checked = s.enabled !== false;
+    ctl.showTop.checked = s.showTop !== false;
+    ctl.showBottom.checked = s.showBottom !== false;
+    ctl.fontSize.value = s.fontSize;
+    ctl.opacity.value = s.opacity;
+    ctl.speed.value = s.speed;
+    ctl.offset.value = s.offset;
+    refreshValueLabels();
+  });
+
   iina.postMessage("sidebar-ready", {});
 </script>
 </body>

@@ -5,9 +5,11 @@
 let cm = null;
 let provider = null;
 let lastTime = 0;
+let cachedXml = null;
+let cachedTitle = "";
 
-// Baseline stage width CCL scroll speed is tuned against.
-const BASE_WIDTH = 680;
+// M4 overlay-side settings (mirrors main.js, applied on load / live update).
+let ov = { speed: 680, fontSize: 25, showTop: true, showBottom: true };
 
 function ensureCM() {
     if (cm) {
@@ -17,8 +19,17 @@ function ensureCM() {
     cm.init();
     // Drop advanced / code / BAS comments (mode 7/8/9).
     cm.filter.allowUnknownTypes = false;
+    applyFilter();
     resize();
     cm.start();
+}
+
+function applyFilter() {
+    if (!cm) {
+        return;
+    }
+    cm.filter.allowTypes[5] = ov.showTop;
+    cm.filter.allowTypes[4] = ov.showBottom;
 }
 
 function resize() {
@@ -26,13 +37,17 @@ function resize() {
         return;
     }
     const stage = document.getElementById("stage");
-    const w = (stage && stage.offsetWidth) || window.innerWidth || BASE_WIDTH;
-    cm.options.scroll.scale = w / BASE_WIDTH;
+    const w = (stage && stage.offsetWidth) || window.innerWidth || ov.speed;
+    cm.options.scroll.scale = w / ov.speed;
     cm.setBounds();
 }
 
-iina.onMessage("load", (data) => {
-    ensureCM();
+// Unify per-comment size to the user-chosen font size.
+function scaledXml(xml, size) {
+    return xml.replace(/(<d p="[\d.]+,\d+,)\d+(,)/g, "$1" + size + "$2");
+}
+
+function buildProvider() {
     if (provider) {
         try {
             provider.destroy();
@@ -42,15 +57,52 @@ iina.onMessage("load", (data) => {
     cm.clear();
     provider.addTarget(cm);
     provider.addStaticSource(
-        Promise.resolve(data.xml),
+        Promise.resolve(scaledXml(cachedXml, ov.fontSize)),
         CommentProvider.SOURCE_TEXT).addParser(
         new BilibiliFormat.TextParser(),
         CommentProvider.SOURCE_TEXT);
     provider.start().then(() => {
         cm.start();
-        lastTime = 0;
-        iina.postMessage("loaded", { title: data.title });
+        cm.time(Math.floor(lastTime * 1000));
+        iina.postMessage("loaded", { title: cachedTitle });
     });
+}
+
+iina.onMessage("load", (data) => {
+    ensureCM();
+    cachedXml = data.xml;
+    cachedTitle = data.title || "";
+    lastTime = 0;
+    if (data.settings) {
+        ov.speed = data.settings.speed || ov.speed;
+        ov.fontSize = data.settings.fontSize || ov.fontSize;
+        ov.showTop = data.settings.showTop !== false;
+        ov.showBottom = data.settings.showBottom !== false;
+    }
+    applyFilter();
+    resize();
+    buildProvider();
+});
+
+iina.onMessage("filter", (d) => {
+    ov.showTop = d.showTop !== false;
+    ov.showBottom = d.showBottom !== false;
+    applyFilter();
+});
+
+iina.onMessage("style", (d) => {
+    let needReload = false;
+    if (d.speed && d.speed !== ov.speed) {
+        ov.speed = d.speed;
+        resize();
+    }
+    if (d.fontSize && d.fontSize !== ov.fontSize) {
+        ov.fontSize = d.fontSize;
+        needReload = true;
+    }
+    if (needReload && cachedXml && cm) {
+        buildProvider();
+    }
 });
 
 iina.onMessage("time", (t) => {

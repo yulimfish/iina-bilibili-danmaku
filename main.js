@@ -3,6 +3,7 @@
 // M1: sidebar panel lifecycle, main-entry menu, toggle state.
 // M2: BV-source channel — view API -> parts -> cid -> danmaku XML -> overlay.
 // M3: bangumi channel — search / ep-ss-md links -> seasons -> episodes -> cid.
+// M4: danmaku controls — toggle / font / opacity / speed / offset / clear.
 
 const { core, console, menu, sidebar, overlay, event, mpv, http, global, preferences } = iina;
 
@@ -46,6 +47,21 @@ console.log(TAG + " sidebar file loaded");
 sidebar.onMessage("sidebar-ready", () => {
     console.log(TAG + " sidebar ready");
     sidebar.postMessage("state", { loaded: false, status: "idle" });
+    sidebar.postMessage("settings", { settings: settings });
+});
+sidebar.onMessage("update-settings", (data) => {
+    if (data && data.patch) {
+        applySettings(data.patch);
+    }
+});
+sidebar.onMessage("clear-danmaku", () => {
+    danmakuActive = false;
+    pendingXml = null;
+    if (overlayLoaded) {
+        overlay.postMessage("clear", {});
+    }
+    sidebar.postMessage("status", { text: "已清空弹幕" });
+    console.log(TAG + " danmaku cleared");
 });
 
 const rootItem = menu.item("Bili Danmaku");
@@ -65,6 +81,73 @@ let overlayLoaded = false; // iina.plugin-overlay-loaded fired
 let pendingXml = null; // load arrived before overlay webview was ready
 let danmakuActive = false;
 let loadToken = 0; // guards against overlapping loadSource calls
+
+// ---------------------------------------------------------------------------
+// M4: settings (persisted, synced to sidebar + overlay)
+// ---------------------------------------------------------------------------
+
+const DEFAULT_SETTINGS = {
+    enabled: true, // overlay visible
+    showTop: true, // fixed top comments (mode 5)
+    showBottom: true, // fixed bottom comments (mode 4)
+    fontSize: 25, // px, replaces per-comment size
+    opacity: 100, // 0-100
+    speed: 680, // CCL scroll baseline; larger = faster
+    offset: 0 // seconds added to playback position
+};
+
+let settings = Object.assign({}, DEFAULT_SETTINGS);
+
+function loadSettings() {
+    try {
+        const saved = preferences.get("settings");
+        if (saved && typeof saved === "object") {
+            settings = Object.assign({}, DEFAULT_SETTINGS, saved);
+        }
+    } catch (e) { /* ignore */ }
+}
+
+function saveSettings() {
+    try {
+        preferences.set("settings", settings);
+        preferences.sync();
+    } catch (e) { /* ignore */ }
+}
+
+function overlaySettings() {
+    return {
+        speed: settings.speed,
+        fontSize: settings.fontSize,
+        showTop: settings.showTop,
+        showBottom: settings.showBottom
+    };
+}
+
+function applySettings(patch) {
+    Object.assign(settings, patch);
+    saveSettings();
+    if (overlayLoaded) {
+        if ("enabled" in patch) {
+            if (settings.enabled) {
+                overlay.show();
+            } else {
+                overlay.hide();
+            }
+        }
+        if ("opacity" in patch) {
+            overlay.setOpacity(settings.opacity / 100);
+        }
+        if ("showTop" in patch || "showBottom" in patch) {
+            overlay.postMessage("filter", { showTop: settings.showTop, showBottom: settings.showBottom });
+        }
+        if ("speed" in patch || "fontSize" in patch) {
+            overlay.postMessage("style", { speed: settings.speed, fontSize: settings.fontSize });
+        }
+    }
+    sidebar.postMessage("settings", { settings: settings });
+}
+
+loadSettings();
 
 function extractBvid(text) {
     const m = /BV[a-zA-Z0-9]{10}/.exec((text || "").trim());
@@ -357,11 +440,15 @@ function pushToOverlay(xml) {
         overlayReady = true;
     }
     overlay.setClickable(false);
+    const payload = { xml: xml, title: video.title, settings: overlaySettings() };
     if (overlayLoaded) {
-        overlay.show();
-        overlay.postMessage("load", { xml: xml, title: video.title });
+        if (settings.enabled) {
+            overlay.show();
+        }
+        overlay.setOpacity(settings.opacity / 100);
+        overlay.postMessage("load", payload);
     } else {
-        pendingXml = { xml: xml, title: video.title };
+        pendingXml = payload;
     }
 }
 
@@ -402,7 +489,10 @@ event.on("iina.plugin-overlay-loaded", () => {
     overlay.setClickable(false);
     console.log(TAG + " overlay loaded");
     if (pendingXml) {
-        overlay.show();
+        if (settings.enabled) {
+            overlay.show();
+        }
+        overlay.setOpacity(settings.opacity / 100);
         overlay.postMessage("load", pendingXml);
         pendingXml = null;
     }
@@ -412,10 +502,10 @@ overlay.onMessage("loaded", (data) => {
     console.log(TAG + " overlay rendered: " + (data && data.title));
 });
 
-// Playback sync: position, pause, window resize, file end.
+// Playback sync: position (+offset), pause, window resize, file end.
 event.on("mpv.time-pos.changed", (t) => {
     if (danmakuActive && overlayLoaded) {
-        overlay.postMessage("time", { time: t });
+        overlay.postMessage("time", { time: t + settings.offset });
     }
 });
 
