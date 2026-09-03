@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 10px;
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 12px; color: #eee; background: transparent;
+  }
+  .tabs { display: flex; gap: 4px; margin-bottom: 10px; }
+  .tab {
+    flex: 1; padding: 5px 0; text-align: center; cursor: pointer;
+    background: #333; color: #ccc; border: none; border-radius: 4px; font-size: 12px;
+  }
+  .tab.active { background: #1a73e8; color: #fff; }
+  .hidden { display: none; }
+  .section-title { font-weight: bold; margin: 8px 0 6px; }
+  .row { display: flex; gap: 6px; margin: 6px 0; }
+  input[type="text"] {
+    width: 100%; box-sizing: border-box; padding: 5px 6px;
+    background: #222; color: #eee; border: 1px solid #555; border-radius: 4px;
+  }
+  button.action {
+    flex: 1; padding: 5px 0;
+    background: #444; color: #eee; border: none; border-radius: 4px; font-size: 12px;
+  }
+  button.action:disabled { opacity: 0.5; }
+  .status { color: #aaa; margin: 6px 0; }
+  .list {
+    max-height: 140px; overflow-y: auto;
+    border: 1px solid #444; border-radius: 4px; padding: 6px; color: #888;
+  }
+  label.opt { display: block; margin: 6px 0; }
+  input[type="range"] { width: 100%; }
+  .hint { color: #777; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="tabs">
+  <button class="tab active" id="tabbtn-source">弹幕源</button>
+  <button class="tab" id="tabbtn-settings">设置</button>
+</div>
+
+<div id="tab-source">
+  <div class="section-title">① 弹幕源</div>
+  <input type="text" id="source-input" placeholder="BV号 / 视频链接" disabled>
+  <div class="row">
+    <!-- TODO(M2): enable, fetch BV -> cid -> danmaku XML -->
+    <button class="action" disabled>▶ 加载弹幕</button>
+    <!-- TODO(M2/M3): enable, episode/part picker -->
+    <button class="action" disabled>分P/选集 ▾</button>
+  </div>
+  <div class="status" id="status-line">状态：未加载</div>
+  <div class="list">（空）</div>
+</div>
+
+<div id="tab-settings" class="hidden">
+  <div class="section-title">② 弹幕控制</div>
+  <!-- TODO(M4): wire all controls -->
+  <label class="opt"><input type="checkbox" checked disabled> 显示弹幕</label>
+  <label class="opt"><input type="checkbox" checked disabled> 顶部弹幕</label>
+  <label class="opt"><input type="checkbox" checked disabled> 底部弹幕</label>
+  <label class="opt">字号 <input type="range" min="18" max="36" value="25" disabled></label>
+  <label class="opt">透明度 <input type="range" min="0" max="100" value="100" disabled></label>
+  <label class="opt">速度 <input type="range" min="200" max="1200" value="680" disabled></label>
+  <label class="opt">偏移 <input type="range" min="-30" max="30" value="0" disabled></label>
+  <div class="row">
+    <button class="action" disabled>清空弹幕</button>
+    <button class="action" disabled>重置偏移</button>
+  </div>
+  <div class="hint">M1 骨架：面板可开可关，控件暂不可用。</div>
+</div>
+
+<script>
+  // Tab switching is local UI state only; structure untouched.
+  document.getElementById("tabbtn-source").onclick = () => switchTab("source");
+  document.getElementById("tabbtn-settings").onclick = () => switchTab("settings");
+
+  function switchTab(which) {
+    const isSource = which === "source";
+    document.getElementById("tab-source").classList.toggle("hidden", !isSource);
+    document.getElementById("tab-settings").classList.toggle("hidden", isSource);
+    document.getElementById("tabbtn-source").classList.toggle("active", isSource);
+    document.getElementById("tabbtn-settings").classList.toggle("active", !isSource);
+  }
+
+  // Handshake with main.js; sidebar webview cannot touch iina API directly.
+  iina.onMessage("state", (data) => {
+    if (data && data.status === "idle") {
+      document.getElementById("status-line").textContent = "状态：未加载";
+    }
+  });
+  iina.postMessage("sidebar-ready", {});
+</script>
+</body>
+</html>

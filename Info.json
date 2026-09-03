@@ -1,0 +1,22 @@
+{
+    "name": "Bili Danmaku",
+    "identifier": "cn.waterflames.iina-bilibili-danmaku",
+    "version": "0.1.0",
+    "description": "Map Bilibili danmaku to local videos in IINA",
+    "author": {
+        "name": "Yulimfish",
+        "email": "epeiuss@waterflames.cn",
+        "url": "https://github.com/Yulimfish"
+    },
+    "entry": "main.js",
+    "globalEntry": "global.js",
+    "permissions": [
+        "show-osd",
+        "video-overlay",
+        "file-system",
+        "network-request"
+    ],
+    "sidebarTab": {
+        "name": "Bili Danmaku"
+    }
+}
