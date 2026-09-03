@@ -28,10 +28,14 @@
   }
   button.action:disabled { opacity: 0.5; }
   .status { color: #aaa; margin: 6px 0; }
+  .status.error { color: #ff8080; }
   .list {
     max-height: 140px; overflow-y: auto;
     border: 1px solid #444; border-radius: 4px; padding: 6px; color: #888;
   }
+  .part { padding: 3px 4px; border-radius: 3px; cursor: pointer; color: #ccc; }
+  .part:hover { background: #333; }
+  .part.current { background: #1a73e8; color: #fff; }
   label.opt { display: block; margin: 6px 0; }
   input[type="range"] { width: 100%; }
   .hint { color: #777; margin-top: 10px; }
@@ -45,15 +49,12 @@
 
 <div id="tab-source">
   <div class="section-title">① 弹幕源</div>
-  <input type="text" id="source-input" placeholder="BV号 / 视频链接" disabled>
+  <input type="text" id="source-input" placeholder="BV号 / 视频链接">
   <div class="row">
-    <!-- TODO(M2): enable, fetch BV -> cid -> danmaku XML -->
-    <button class="action" disabled>▶ 加载弹幕</button>
-    <!-- TODO(M2/M3): enable, episode/part picker -->
-    <button class="action" disabled>分P/选集 ▾</button>
+    <button class="action" id="load-btn">▶ 加载弹幕</button>
   </div>
   <div class="status" id="status-line">状态：未加载</div>
-  <div class="list">（空）</div>
+  <div class="list" id="part-list">（空）</div>
 </div>
 
 <div id="tab-settings" class="hidden">
@@ -86,10 +87,57 @@
     document.getElementById("tabbtn-settings").classList.toggle("active", !isSource);
   }
 
+  // M2: BV-source channel wiring.
+  document.getElementById("load-btn").onclick = () => {
+    setStatus("正在加载…", false);
+    iina.postMessage("load-source", {
+      text: document.getElementById("source-input").value
+    });
+  };
+
+  function setStatus(text, isError) {
+    const el = document.getElementById("status-line");
+    el.textContent = "状态：" + text;
+    el.classList.toggle("error", !!isError);
+  }
+
+  iina.onMessage("video", (data) => {
+    if (!data) {
+      return;
+    }
+    setStatus("「" + data.title + "」", false);
+    const list = document.getElementById("part-list");
+    list.textContent = "";
+    if (!data.parts || data.parts.length <= 1) {
+      // Single part (or bangumi episode, M3): nothing to pick.
+      list.textContent = data.title || "（空）";
+      return;
+    }
+    data.parts.forEach((p, i) => {
+      const div = document.createElement("div");
+      div.className = "part" + (i === data.current ? " current" : "");
+      div.textContent = "P" + p.page + " " + (p.part || "");
+      div.onclick = () => iina.postMessage("select-part", { index: i });
+      list.appendChild(div);
+    });
+  });
+
+  iina.onMessage("status", (data) => {
+    if (data) {
+      setStatus(data.text, false);
+    }
+  });
+
+  iina.onMessage("error", (data) => {
+    if (data) {
+      setStatus(data.message, true);
+    }
+  });
+
   // Handshake with main.js; sidebar webview cannot touch iina API directly.
   iina.onMessage("state", (data) => {
     if (data && data.status === "idle") {
-      document.getElementById("status-line").textContent = "状态：未加载";
+      setStatus("未加载", false);
     }
   });
   iina.postMessage("sidebar-ready", {});
