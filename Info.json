@@ -10,6 +10,8 @@
     },
     "entry": "main.js",
     "globalEntry": "global.js",
+    "ghRepo": "Yulimfish/iina-bilibili-danmaku",
+    "ghVersion": 1,
     "permissions": [
         "show-osd",
         "video-overlay",

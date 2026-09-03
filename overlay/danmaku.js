@@ -65,6 +65,8 @@ function buildProvider() {
         cm.start();
         cm.time(Math.floor(lastTime * 1000));
         iina.postMessage("loaded", { title: cachedTitle });
+    }).catch((e) => {
+        iina.postMessage("overlay-error", { message: String((e && e.message) || e) });
     });
 }
 

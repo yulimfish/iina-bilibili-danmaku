@@ -226,7 +226,7 @@ async function loadPart(index, token) {
     video.index = index;
     const cid = video.parts[index].cid;
     const label = partLabel(index);
-    sidebar.postMessage("status", { text: "正在加载" + label + "弹幕…" });
+    sidebar.postMessage("status", { text: "正在加载" + label + " 弹幕…" });
     const xml = await biliDanmakuXml(cid);
     if (token !== loadToken) {
         return; // superseded by a newer load
@@ -500,6 +500,11 @@ event.on("iina.plugin-overlay-loaded", () => {
 
 overlay.onMessage("loaded", (data) => {
     console.log(TAG + " overlay rendered: " + (data && data.title));
+});
+
+overlay.onMessage("overlay-error", (data) => {
+    console.log(TAG + " overlay error: " + (data && data.message));
+    sidebar.postMessage("error", { message: "弹幕渲染失败，请重新加载" });
 });
 
 // Playback sync: position (+offset), pause, window resize, file end.
