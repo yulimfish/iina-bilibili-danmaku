@@ -27,6 +27,7 @@
     background: #444; color: #eee; border: none; border-radius: 4px; font-size: 12px;
   }
   button.action:disabled { opacity: 0.5; }
+  button.action.current { background: #1a73e8; color: #fff; }
   .status { color: #aaa; margin: 6px 0; }
   .status.error { color: #ff8080; }
   .list {
@@ -49,7 +50,11 @@
 
 <div id="tab-source">
   <div class="section-title">① 弹幕源</div>
-  <input type="text" id="source-input" placeholder="BV号 / 视频链接">
+  <div class="row">
+    <button class="action" id="mode-bv">BV号/链接</button>
+    <button class="action" id="mode-search">搜剧集</button>
+  </div>
+  <input type="text" id="source-input" placeholder="BV号 / 视频链接 / ep·ss·md 链接">
   <div class="row">
     <button class="action" id="load-btn">▶ 加载弹幕</button>
   </div>
@@ -87,12 +92,33 @@
     document.getElementById("tabbtn-settings").classList.toggle("active", !isSource);
   }
 
+  // M3: BV/link vs bangumi-search input modes.
+  let inputMode = "bv";
+  const sourceInput = document.getElementById("source-input");
+  const loadBtn = document.getElementById("load-btn");
+  const modeBv = document.getElementById("mode-bv");
+  const modeSearch = document.getElementById("mode-search");
+
+  function setInputMode(mode) {
+    inputMode = mode;
+    const isSearch = mode === "search";
+    modeBv.classList.toggle("current", !isSearch);
+    modeSearch.classList.toggle("current", isSearch);
+    sourceInput.placeholder = isSearch ? "番剧名称" : "BV号 / 视频链接 / ep·ss·md 链接";
+    loadBtn.textContent = isSearch ? "🔍 搜索" : "▶ 加载弹幕";
+  }
+  modeBv.onclick = () => setInputMode("bv");
+  modeSearch.onclick = () => setInputMode("search");
+  setInputMode("bv");
+
   // M2: BV-source channel wiring.
-  document.getElementById("load-btn").onclick = () => {
+  loadBtn.onclick = () => {
     setStatus("正在加载…", false);
-    iina.postMessage("load-source", {
-      text: document.getElementById("source-input").value
-    });
+    if (inputMode === "search") {
+      iina.postMessage("search-bangumi", { keyword: sourceInput.value });
+    } else {
+      iina.postMessage("load-source", { text: sourceInput.value });
+    }
   };
 
   function setStatus(text, isError) {
@@ -101,25 +127,41 @@
     el.classList.toggle("error", !!isError);
   }
 
+  function renderPickList(items, current, onPick) {
+    const list = document.getElementById("part-list");
+    list.textContent = "";
+    items.forEach((label, i) => {
+      const div = document.createElement("div");
+      div.className = "part" + (i === current ? " current" : "");
+      div.textContent = label;
+      div.onclick = () => onPick(i);
+      list.appendChild(div);
+    });
+  }
+
   iina.onMessage("video", (data) => {
     if (!data) {
       return;
     }
     setStatus("「" + data.title + "」", false);
-    const list = document.getElementById("part-list");
-    list.textContent = "";
-    if (!data.parts || data.parts.length <= 1) {
-      // Single part (or bangumi episode, M3): nothing to pick.
-      list.textContent = data.title || "（空）";
+    if (!data.parts || !data.parts.length) {
+      document.getElementById("part-list").textContent = data.title || "（空）";
       return;
     }
-    data.parts.forEach((p, i) => {
-      const div = document.createElement("div");
-      div.className = "part" + (i === data.current ? " current" : "");
-      div.textContent = "P" + p.page + " " + (p.part || "");
-      div.onclick = () => iina.postMessage("select-part", { index: i });
-      list.appendChild(div);
-    });
+    // M3: episodes render as 第X集 + long title; BV parts as P1/P2…
+    const labels = data.parts.map((p) =>
+      data.kind === "episodes" ? "第" + p.page + "集 " + (p.part || "") : "P" + p.page + " " + (p.part || ""));
+    renderPickList(labels, data.current, (i) => iina.postMessage("select-part", { index: i }));
+  });
+
+  // M3: season search results -> episode list.
+  iina.onMessage("seasons", (data) => {
+    if (!data || !data.seasons) {
+      return;
+    }
+    const labels = data.seasons.map((s) => s.title + (s.year ? " (" + s.year + ")" : ""));
+    renderPickList(labels, -1, (i) =>
+      iina.postMessage("select-season", { season_id: data.seasons[i].season_id }));
   });
 
   iina.onMessage("status", (data) => {
