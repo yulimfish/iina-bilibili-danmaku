@@ -22,12 +22,19 @@ const BILI_HEADERS = {
 let sidebarVisible = false;
 
 function showSidebar() {
+    if (!core.window.loaded) {
+        console.log(TAG + " cannot show sidebar before window-loaded");
+        return;
+    }
     sidebar.show();
     sidebarVisible = true;
     console.log(TAG + " sidebar shown");
 }
 
 function hideSidebar() {
+    if (!core.window.loaded) {
+        return;
+    }
     sidebar.hide();
     sidebarVisible = false;
     console.log(TAG + " sidebar hidden");
@@ -41,34 +48,48 @@ function toggleSidebar() {
     }
 }
 
-sidebar.loadFile("sidebar/index.html");
-console.log(TAG + " sidebar file loaded");
-
-sidebar.onMessage("sidebar-ready", () => {
-    console.log(TAG + " sidebar ready");
-    sidebar.postMessage("state", { loaded: false, status: "idle" });
-    sidebar.postMessage("settings", { settings: settings });
-});
-sidebar.onMessage("update-settings", (data) => {
-    if (data && data.patch) {
-        applySettings(data.patch);
-    }
-});
-sidebar.onMessage("clear-danmaku", () => {
-    danmakuActive = false;
-    pendingXml = null;
-    if (overlayLoaded) {
-        overlay.postMessage("clear", {});
-    }
-    sidebar.postMessage("status", { text: "已清空弹幕" });
-    console.log(TAG + " danmaku cleared");
-});
-
 const rootItem = menu.item("Bili Danmaku");
 rootItem.addSubMenuItem(menu.item("Toggle Danmaku Panel", toggleSidebar));
 menu.addItem(rootItem);
 
 global.onMessage(TOGGLE_SIDEBAR, toggleSidebar);
+
+// Sidebar and overlay views require an initialized player window. Loading the
+// sidebar before window-loaded raises an exception and aborts the entry file.
+let sidebarInitialized = false;
+function initializeSidebar() {
+    if (sidebarInitialized || !core.window.loaded) {
+        return;
+    }
+    sidebarInitialized = true;
+    sidebar.loadFile("sidebar/index.html");
+    console.log(TAG + " sidebar file loaded");
+
+    sidebar.onMessage("sidebar-ready", () => {
+        console.log(TAG + " sidebar ready");
+        sidebar.postMessage("state", { loaded: false, status: "idle" });
+        sidebar.postMessage("settings", { settings: settings });
+    });
+    sidebar.onMessage("update-settings", (data) => {
+        if (data && data.patch) {
+            applySettings(data.patch);
+        }
+    });
+    sidebar.onMessage("clear-danmaku", () => {
+        danmakuActive = false;
+        pendingXml = null;
+        if (overlayLoaded) {
+            overlay.postMessage("clear", {});
+        }
+        sidebar.postMessage("status", { text: "已清空弹幕" });
+        console.log(TAG + " danmaku cleared");
+    });
+}
+event.on("iina.window-loaded", initializeSidebar);
+// Covers a player whose window was already loaded before this entry ran.
+if (core.window.loaded) {
+    initializeSidebar();
+}
 
 // ---------------------------------------------------------------------------
 // M2: Bilibili BV channel
