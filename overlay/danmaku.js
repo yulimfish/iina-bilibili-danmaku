@@ -11,6 +11,13 @@ let cachedTitle = "";
 // M4 overlay-side settings (mirrors main.js, applied on load / live update).
 let ov = { speed: 680, fontSize: 25, showTop: true, showBottom: true };
 
+// The plugin registers its overlay listeners after the navigation-finished
+// event, so respond to a ping to prove this is the overlay webview (not the
+// sidebar webview, which emits the same IINA event).
+iina.onMessage("ping", () => {
+    iina.postMessage("overlay-ready", {});
+});
+
 function ensureCM() {
     if (cm) {
         return;

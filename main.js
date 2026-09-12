@@ -97,8 +97,9 @@ if (core.window.loaded) {
 
 // Current video source. XML itself is forwarded to the overlay, not cached.
 let video = null; // { bvid, title, parts: [{page, part, cid}], index }
-let overlayReady = false; // overlay.loadFile called
-let overlayLoaded = false; // iina.plugin-overlay-loaded fired
+let overlayRequested = false; // overlay.loadFile called
+let overlayLoaded = false; // overlay answered the private readiness ping
+let overlayMessagesRegistered = false;
 let pendingXml = null; // load arrived before overlay webview was ready
 let danmakuActive = false;
 let loadToken = 0; // guards against overlapping loadSource calls
@@ -456,9 +457,9 @@ async function loadBangumiLink(link, token) {
 }
 
 function pushToOverlay(xml) {
-    if (!overlayReady) {
+    if (!overlayRequested) {
         overlay.loadFile("overlay/danmaku.html");
-        overlayReady = true;
+        overlayRequested = true;
     }
     overlay.setClickable(false);
     const payload = { xml: xml, title: video.title, settings: overlaySettings() };
@@ -504,28 +505,37 @@ sidebar.onMessage("select-part", (data) => {
     });
 });
 
-// Overlay lifecycle.
+// Both sidebar and overlay webviews emit iina.plugin-overlay-loaded. Only
+// install overlay listeners after this plugin has requested the overlay, then
+// use a private ping/response handshake to identify the correct webview.
 event.on("iina.plugin-overlay-loaded", () => {
-    overlayLoaded = true;
-    overlay.setClickable(false);
-    console.log(TAG + " overlay loaded");
-    if (pendingXml) {
-        if (settings.enabled) {
-            overlay.show();
-        }
-        overlay.setOpacity(settings.opacity / 100);
-        overlay.postMessage("load", pendingXml);
-        pendingXml = null;
+    if (!overlayRequested) {
+        return;
     }
-});
-
-overlay.onMessage("loaded", (data) => {
-    console.log(TAG + " overlay rendered: " + (data && data.title));
-});
-
-overlay.onMessage("overlay-error", (data) => {
-    console.log(TAG + " overlay error: " + (data && data.message));
-    sidebar.postMessage("error", { message: "弹幕渲染失败，请重新加载" });
+    if (!overlayMessagesRegistered) {
+        overlayMessagesRegistered = true;
+        overlay.onMessage("overlay-ready", () => {
+            overlayLoaded = true;
+            overlay.setClickable(false);
+            console.log(TAG + " overlay ready");
+            if (pendingXml) {
+                if (settings.enabled) {
+                    overlay.show();
+                }
+                overlay.setOpacity(settings.opacity / 100);
+                overlay.postMessage("load", pendingXml);
+                pendingXml = null;
+            }
+        });
+        overlay.onMessage("loaded", (data) => {
+            console.log(TAG + " overlay rendered: " + (data && data.title));
+        });
+        overlay.onMessage("overlay-error", (data) => {
+            console.log(TAG + " overlay error: " + (data && data.message));
+            sidebar.postMessage("error", { message: "弹幕渲染失败，请重新加载" });
+        });
+    }
+    overlay.postMessage("ping", {});
 });
 
 // Playback sync: position (+offset), pause, window resize, file end.
