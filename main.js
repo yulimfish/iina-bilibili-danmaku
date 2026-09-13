@@ -72,11 +72,7 @@ function initializeSidebar() {
         }
     });
     sidebar.onMessage("clear-danmaku", () => {
-        danmakuActive = false;
-        pendingXml = null;
-        if (overlayLoaded) {
-            overlay.postMessage("clear", {});
-        }
+        invalidateCurrentLoad();
         sidebar.postMessage("status", { text: "已清空弹幕" });
         console.log(TAG + " danmaku cleared");
     });
@@ -96,9 +92,19 @@ let video = null; // { bvid, title, parts: [{page, part, cid}], index }
 let overlayRequested = false; // overlay.loadFile called
 let overlayLoaded = false; // overlay answered the private readiness ping
 let overlayMessagesRegistered = false;
-let pendingXml = null; // load arrived before overlay webview was ready
+let pendingStream = null; // load arrived before overlay webview was ready
+let nextStreamId = 0;
+let currentStreamId = 0;
+let streamPumpGeneration = 0;
 let danmakuActive = false;
+let streamLoading = false;
 let loadToken = 0; // guards against overlapping loadSource calls
+let latestPlaybackTime = null;
+let lastSentPlaybackTime = null;
+let lastTimeSentAt = 0;
+let playbackPaused = false;
+const XML_CHUNK_SIZE = 128 * 1024;
+const TIME_UPDATE_INTERVAL = 33;
 
 // ---------------------------------------------------------------------------
 // M4: settings (persisted, synced to sidebar + overlay)
@@ -144,6 +150,9 @@ function overlaySettings() {
 function applySettings(patch) {
     Object.assign(settings, patch);
     saveSettings();
+    if (pendingStream) {
+        pendingStream.settings = overlaySettings();
+    }
     if (overlayLoaded) {
         if ("enabled" in patch) {
             if (settings.enabled) {
@@ -160,6 +169,9 @@ function applySettings(patch) {
         }
         if ("speed" in patch || "fontSize" in patch) {
             overlay.postMessage("style", { speed: settings.speed, fontSize: settings.fontSize });
+        }
+        if ("offset" in patch && latestPlaybackTime !== null) {
+            syncPlaybackTime(latestPlaybackTime, true);
         }
     }
     sidebar.postMessage("settings", { settings: settings });
@@ -244,23 +256,17 @@ async function loadPart(index, token) {
     video.index = index;
     const cid = video.parts[index].cid;
     const label = partLabel(index);
-    sidebar.postMessage("status", { text: "正在加载" + label + " 弹幕…" });
+    sidebar.postMessage("status", { text: "正在获取弹幕数据（" + label + "）…" });
     const xml = await biliDanmakuXml(cid);
     if (token !== loadToken) {
         return; // superseded by a newer load
     }
-    if (!/<d[\s>]/.test(xml)) {
-        sidebar.postMessage("status", { text: label + "暂无弹幕" });
-    } else {
-        sidebar.postMessage("status", { text: "已加载「" + video.title + "」" + label });
-    }
     pushToOverlay(xml);
-    danmakuActive = true;
     pushPartsToSidebar();
 }
 
 async function loadSource(text) {
-    const token = ++loadToken;
+    const token = invalidateCurrentLoad();
     if (core.status.idle) {
         sidebar.postMessage("error", { message: "请先播放本地视频，再加载弹幕" });
         return;
@@ -452,38 +458,103 @@ async function loadBangumiLink(link, token) {
     }
 }
 
+function cancelOverlayStream() {
+    streamPumpGeneration += 1;
+    pendingStream = null;
+    currentStreamId = 0;
+    lastSentPlaybackTime = null;
+    streamLoading = false;
+}
+
+function invalidateCurrentLoad() {
+    loadToken += 1;
+    cancelOverlayStream();
+    danmakuActive = false;
+    if (overlayLoaded) {
+        overlay.postMessage("clear", {});
+    }
+    return loadToken;
+}
+
+function startOverlayStream(payload) {
+    const generation = ++streamPumpGeneration;
+    let xml = payload.xml || "";
+    let offset = 0;
+
+    sidebar.postMessage("status", { text: "弹幕数据已下载，正在传输…" });
+    if (settings.enabled) {
+        overlay.show();
+    }
+    overlay.setOpacity(settings.opacity / 100);
+    overlay.postMessage("stream-start", {
+        streamId: payload.streamId,
+        title: payload.title,
+        settings: payload.settings,
+        paused: playbackPaused,
+        initialTime: latestPlaybackTime === null
+            ? 0
+            : latestPlaybackTime + settings.offset
+    });
+
+    function pump() {
+        if (generation !== streamPumpGeneration || !overlayLoaded ||
+            payload.streamId !== currentStreamId) {
+            return;
+        }
+        if (offset >= xml.length) {
+            overlay.postMessage("stream-end", { streamId: payload.streamId });
+            xml = "";
+            return;
+        }
+        const chunk = xml.slice(offset, offset + XML_CHUNK_SIZE);
+        offset += chunk.length;
+        overlay.postMessage("stream-chunk", {
+            streamId: payload.streamId,
+            chunk: chunk
+        });
+        setTimeout(pump, 0);
+    }
+    pump();
+}
+
 function pushToOverlay(xml) {
+    cancelOverlayStream();
+    const payload = {
+        streamId: ++nextStreamId,
+        xml: xml,
+        title: video.title,
+        settings: overlaySettings()
+    };
+    currentStreamId = payload.streamId;
+    danmakuActive = false;
+    streamLoading = true;
     if (!overlayRequested) {
         overlay.loadFile("overlay/danmaku.html");
         overlayRequested = true;
     }
     overlay.setClickable(false);
-    const payload = { xml: xml, title: video.title, settings: overlaySettings() };
     if (overlayLoaded) {
-        if (settings.enabled) {
-            overlay.show();
-        }
-        overlay.setOpacity(settings.opacity / 100);
-        overlay.postMessage("load", payload);
+        startOverlayStream(payload);
     } else {
-        pendingXml = payload;
+        pendingStream = payload;
+        sidebar.postMessage("status", { text: "弹幕数据已下载，等待渲染器…" });
     }
 }
 
 // Sidebar -> plugin messages.
 sidebar.onMessage("load-source", (data) => {
-    loadSource(data && data.text);
+    return loadSource(data && data.text);
 });
 sidebar.onMessage("search-bangumi", (data) => {
-    const token = ++loadToken;
-    searchBangumi(data && data.keyword, token);
+    const token = invalidateCurrentLoad();
+    return searchBangumi(data && data.keyword, token);
 });
 sidebar.onMessage("select-season", (data) => {
     if (!data || !data.season_id) {
         return;
     }
-    const token = ++loadToken;
-    loadSeasonById(String(data.season_id), token, null);
+    const token = invalidateCurrentLoad();
+    return loadSeasonById(String(data.season_id), token, null);
 });
 sidebar.onMessage("select-part", (data) => {
     if (!video || !data) {
@@ -493,8 +564,8 @@ sidebar.onMessage("select-part", (data) => {
     if (index < 0 || index >= video.parts.length || index === video.index) {
         return;
     }
-    const token = ++loadToken;
-    loadPart(index, token).catch((e) => {
+    const token = invalidateCurrentLoad();
+    return loadPart(index, token).catch((e) => {
         if (token === loadToken) {
             reportError(e);
         }
@@ -514,19 +585,59 @@ event.on("iina.plugin-overlay-loaded", () => {
             overlayLoaded = true;
             overlay.setClickable(false);
             console.log(TAG + " overlay ready");
-            if (pendingXml) {
-                if (settings.enabled) {
-                    overlay.show();
-                }
-                overlay.setOpacity(settings.opacity / 100);
-                overlay.postMessage("load", pendingXml);
-                pendingXml = null;
+            if (pendingStream) {
+                const stream = pendingStream;
+                pendingStream = null;
+                startOverlayStream(stream);
+            } else if (danmakuActive && latestPlaybackTime !== null) {
+                syncPlaybackTime(latestPlaybackTime, true);
+            }
+        });
+        overlay.onMessage("stream-state", (data) => {
+            if (!data || data.streamId !== currentStreamId) {
+                return;
+            }
+            const parsed = Number(data.parsed) || 0;
+            const accepted = Number(data.accepted) || 0;
+            if (data.phase === "parsing") {
+                streamLoading = true;
+                sidebar.postMessage("status", { text: "正在解析弹幕（已处理 " + parsed + " 条）…" });
+            } else if (data.phase === "progress") {
+                streamLoading = true;
+                sidebar.postMessage("status", { text: "弹幕已可显示，正在继续解析（已处理 " + parsed + " 条）…" });
+            } else if (data.phase === "available") {
+                streamLoading = true;
+                danmakuActive = true;
+                sidebar.postMessage("status", { text: "弹幕已可显示，正在继续解析…" });
+                pushPartsToSidebar();
+            } else if (data.phase === "complete") {
+                streamLoading = accepted > 0;
+                danmakuActive = accepted > 0;
+                sidebar.postMessage("status", {
+                    text: "已加载「" + video.title + "」" + partLabel(video.index)
+                });
+            } else if (data.phase === "empty") {
+                streamLoading = false;
+                danmakuActive = false;
+                sidebar.postMessage("status", { text: partLabel(video.index) + "暂无弹幕" });
+            } else if (data.phase === "error") {
+                streamLoading = false;
+                danmakuActive = false;
+                cancelOverlayStream();
+                sidebar.postMessage("error", { message: "弹幕渲染失败，请重新加载" });
             }
         });
         overlay.onMessage("loaded", (data) => {
-            console.log(TAG + " overlay rendered: " + (data && data.title));
+            if (data && data.streamId === currentStreamId) {
+                console.log(TAG + " overlay available: " + data.title);
+            }
         });
         overlay.onMessage("overlay-error", (data) => {
+            if (!data || data.streamId !== currentStreamId) {
+                return;
+            }
+            danmakuActive = false;
+            cancelOverlayStream();
             console.log(TAG + " overlay error: " + (data && data.message));
             sidebar.postMessage("error", { message: "弹幕渲染失败，请重新加载" });
         });
@@ -535,15 +646,36 @@ event.on("iina.plugin-overlay-loaded", () => {
 });
 
 // Playback sync: position (+offset), pause, window resize, file end.
-event.on("mpv.time-pos.changed", (t) => {
-    if (danmakuActive && overlayLoaded) {
-        overlay.postMessage("time", { time: t + settings.offset });
+function syncPlaybackTime(time, force) {
+    if (time === null || time === undefined || time === "") {
+        return;
     }
-});
+    const nextTime = Number(time);
+    if (!Number.isFinite(nextTime)) {
+        return;
+    }
+    latestPlaybackTime = nextTime;
+    if (!overlayLoaded || currentStreamId === 0 || !streamLoading) {
+        return;
+    }
+    const now = Date.now();
+    const jump = lastSentPlaybackTime === null ||
+        nextTime < lastSentPlaybackTime - 0.25 ||
+        Math.abs(nextTime - lastSentPlaybackTime) > 1;
+    if (!force && !jump && now - lastTimeSentAt < TIME_UPDATE_INTERVAL) {
+        return;
+    }
+    lastSentPlaybackTime = nextTime;
+    lastTimeSentAt = now;
+    overlay.postMessage("time", { time: nextTime + settings.offset });
+}
+
+event.on("mpv.time-pos.changed", (t) => syncPlaybackTime(t, false));
 
 event.on("mpv.pause.changed", (paused) => {
-    if (danmakuActive && overlayLoaded) {
-        overlay.postMessage("pause", { paused: paused });
+    playbackPaused = Boolean(paused);
+    if (overlayLoaded && streamLoading) {
+        overlay.postMessage("pause", { paused: playbackPaused });
     }
 });
 
@@ -554,11 +686,8 @@ event.on("mpv.window-scale.changed", () => {
 });
 
 event.on("mpv.end-file", () => {
-    danmakuActive = false;
-    pendingXml = null;
-    if (overlayLoaded) {
-        overlay.postMessage("clear", {});
-    }
+    invalidateCurrentLoad();
+    latestPlaybackTime = null;
 });
 
 console.log(TAG + " main entry loaded");
