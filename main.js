@@ -5,11 +5,9 @@
 // M3: bangumi channel — search / ep-ss-md links -> seasons -> episodes -> cid.
 // M4: danmaku controls — toggle / font / opacity / speed / offset / clear.
 
-const { core, console, menu, sidebar, overlay, event, mpv, http, global, preferences } = iina;
+const { core, console, menu, sidebar, overlay, event, mpv, http, preferences } = iina;
 
 const TAG = "[bili-danmaku]";
-const TOGGLE_SIDEBAR = "bili-danmaku:toggle-sidebar";
-
 const BILI_HEADERS = {
     "Referer": "https://www.bilibili.com",
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
@@ -51,8 +49,6 @@ function toggleSidebar() {
 const rootItem = menu.item("Bili Danmaku");
 rootItem.addSubMenuItem(menu.item("Toggle Danmaku Panel", toggleSidebar));
 menu.addItem(rootItem);
-
-global.onMessage(TOGGLE_SIDEBAR, toggleSidebar);
 
 // Sidebar and overlay views require an initialized player window. Loading the
 // sidebar before window-loaded raises an exception and aborts the entry file.
