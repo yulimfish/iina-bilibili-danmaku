@@ -61,6 +61,37 @@ function initializeSidebar() {
     sidebar.loadFile("sidebar/index.html");
     console.log(TAG + " sidebar file loaded");
 
+    // IINA clears sidebar message listeners inside loadFile, so request
+    // handlers must be registered after the file is loaded.
+    sidebar.onMessage("load-source", (data) => {
+        return loadSource(data && data.text);
+    });
+    sidebar.onMessage("search-bangumi", (data) => {
+        return requestBangumiSearch(data && data.keyword);
+    });
+    sidebar.onMessage("select-season", (data) => {
+        if (!data || !data.season_id) {
+            return;
+        }
+        const token = invalidateCurrentLoad();
+        return loadSeasonById(String(data.season_id), token, null);
+    });
+    sidebar.onMessage("select-part", (data) => {
+        if (!video || !data) {
+            return;
+        }
+        const index = data.index;
+        if (index < 0 || index >= video.parts.length || index === video.index) {
+            return;
+        }
+        const token = invalidateCurrentLoad();
+        return loadPart(index, token).catch((e) => {
+            if (token === loadToken) {
+                reportError(e);
+            }
+        });
+    });
+
     sidebar.onMessage("sidebar-ready", () => {
         console.log(TAG + " sidebar ready");
         sidebar.postMessage("state", { loaded: false, status: "idle" });
@@ -574,7 +605,8 @@ function pushToOverlay(xml) {
         overlay.loadFile("overlay/danmaku.html");
         overlayRequested = true;
     }
-    overlay.setClickable(false);
+    // setClickable is deferred to overlay-ready; touching IINA's lazily created
+    // overlay view from this thread aborts the app.
     if (overlayLoaded) {
         startOverlayStream(payload);
     } else {
@@ -582,36 +614,6 @@ function pushToOverlay(xml) {
         sidebar.postMessage("status", { text: "弹幕数据已下载，等待渲染器…" });
     }
 }
-
-// Sidebar -> plugin messages.
-sidebar.onMessage("load-source", (data) => {
-    return loadSource(data && data.text);
-});
-sidebar.onMessage("search-bangumi", (data) => {
-    return requestBangumiSearch(data && data.keyword);
-});
-sidebar.onMessage("select-season", (data) => {
-    if (!data || !data.season_id) {
-        return;
-    }
-    const token = invalidateCurrentLoad();
-    return loadSeasonById(String(data.season_id), token, null);
-});
-sidebar.onMessage("select-part", (data) => {
-    if (!video || !data) {
-        return;
-    }
-    const index = data.index;
-    if (index < 0 || index >= video.parts.length || index === video.index) {
-        return;
-    }
-    const token = invalidateCurrentLoad();
-    return loadPart(index, token).catch((e) => {
-        if (token === loadToken) {
-            reportError(e);
-        }
-    });
-});
 
 // Both sidebar and overlay webviews emit iina.plugin-overlay-loaded. Only
 // install overlay listeners after this plugin has requested the overlay, then
@@ -670,7 +672,9 @@ event.on("iina.plugin-overlay-loaded", () => {
                 streamLoading = false;
                 danmakuActive = false;
                 cancelOverlayStream();
-                sidebar.postMessage("error", { message: "弹幕渲染失败，请重新加载" });
+                sidebar.postMessage("error", {
+                    message: "弹幕渲染失败（" + (data.message || "未知原因") + "）"
+                });
             }
         });
         overlay.onMessage("loaded", (data) => {
@@ -685,7 +689,7 @@ event.on("iina.plugin-overlay-loaded", () => {
             danmakuActive = false;
             cancelOverlayStream();
             console.log(TAG + " overlay error: " + (data && data.message));
-            sidebar.postMessage("error", { message: "弹幕渲染失败，请重新加载" });
+            sidebar.postMessage("error", { message: "弹幕渲染失败（" + ((data && data.message) || "未知原因") + "）" });
         });
     }
     overlay.postMessage("ping", {});

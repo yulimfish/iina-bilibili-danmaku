@@ -10,6 +10,9 @@ const LATE_COMMENT_WINDOW = 1000;
 
 let cm = null;
 let parserWorker = null;
+let workerMessageCount = 0;
+let workerEndForwarded = false;
+let lastWorkerChunk = null;
 let fallbackParser = null;
 let fallbackQueue = [];
 let fallbackEndPending = false;
@@ -269,7 +272,8 @@ function handleParserError(streamId, message) {
         phase: "error",
         parsed: 0,
         accepted: 0,
-        skipped: 0
+        skipped: 0,
+        message: message
     });
     iina.postMessage("overlay-error", { streamId: failedStreamId, message: message });
 }
@@ -279,6 +283,7 @@ function handleWorkerMessage(event) {
     if (data.streamId !== activeStreamId) {
         return;
     }
+    workerMessageCount += 1;
     if (data.type === "comments") {
         appendComments(data.streamId, data.comments, data);
     } else if (data.type === "progress") {
@@ -369,6 +374,9 @@ function stopParser() {
     fallbackQueue = [];
     fallbackEndPending = false;
     fallbackScheduled = false;
+    workerMessageCount = 0;
+    workerEndForwarded = false;
+    lastWorkerChunk = null;
     if (parserWorker) {
         try {
             parserWorker.postMessage({ type: "cancel", streamId: activeStreamId });
@@ -381,14 +389,56 @@ function stopParser() {
     fallbackParser = null;
 }
 
+function enqueueFallbackChunk(chunkId, chunk) {
+    if (chunk.length === 0) {
+        fallbackQueue.push({ chunk: "", acknowledge: true, chunkId: chunkId });
+    } else {
+        for (let offset = 0; offset < chunk.length; offset += FALLBACK_CHUNK_SIZE) {
+            fallbackQueue.push({
+                chunk: chunk.slice(offset, offset + FALLBACK_CHUNK_SIZE),
+                acknowledge: offset + FALLBACK_CHUNK_SIZE >= chunk.length,
+                chunkId: chunkId
+            });
+        }
+    }
+    scheduleFallbackPump();
+}
+
 function startParser(streamId) {
     try {
-        parserWorker = new Worker("parser-worker.js");
-        parserWorker.onmessage = handleWorkerMessage;
-        parserWorker.onerror = (event) => {
-            handleParserError(streamId, event.message || "parser worker failed");
+        const worker = new Worker("parser-worker.js");
+        parserWorker = worker;
+        workerMessageCount = 0;
+        workerEndForwarded = false;
+        lastWorkerChunk = null;
+        worker.onmessage = handleWorkerMessage;
+        worker.onerror = (event) => {
+            if (parserWorker !== worker) {
+                return;
+            }
+            parserWorker = null;
+            try {
+                worker.terminate();
+            } catch (e) { /* ignore */ }
+            if (workerMessageCount > 0) {
+                handleParserError(streamId, event.message || "parser worker failed");
+                return;
+            }
+            // The worker never produced output, e.g. WKWebView blocks worker
+            // scripts on file:// URLs. Fall back and replay its last chunk.
+            startFallback(streamId);
+            if (fallbackParser) {
+                if (lastWorkerChunk) {
+                    enqueueFallbackChunk(lastWorkerChunk.chunkId, lastWorkerChunk.chunk);
+                    lastWorkerChunk = null;
+                }
+                if (workerEndForwarded) {
+                    fallbackEndPending = true;
+                    scheduleFallbackPump();
+                }
+            }
         };
-        parserWorker.postMessage({ type: "start", streamId: streamId });
+        worker.postMessage({ type: "start", streamId: streamId });
     } catch (error) {
         parserWorker = null;
         startFallback(streamId);
@@ -444,6 +494,7 @@ iina.onMessage("stream-chunk", (data) => {
     }
     try {
         if (parserWorker) {
+            lastWorkerChunk = { chunkId: data.chunkId, chunk: data.chunk };
             parserWorker.postMessage({
                 type: "chunk",
                 streamId: data.streamId,
@@ -453,14 +504,7 @@ iina.onMessage("stream-chunk", (data) => {
             return;
         }
         if (fallbackParser) {
-            for (let offset = 0; offset < data.chunk.length; offset += FALLBACK_CHUNK_SIZE) {
-                fallbackQueue.push({
-                    chunk: data.chunk.slice(offset, offset + FALLBACK_CHUNK_SIZE),
-                    acknowledge: offset + FALLBACK_CHUNK_SIZE >= data.chunk.length,
-                    chunkId: data.chunkId
-                });
-            }
-            scheduleFallbackPump();
+            enqueueFallbackChunk(data.chunkId, data.chunk);
         }
     } catch (error) {
         handleParserError(data.streamId, String((error && error.message) || error));
@@ -473,6 +517,7 @@ iina.onMessage("stream-end", (data) => {
     }
     try {
         if (parserWorker) {
+            workerEndForwarded = true;
             parserWorker.postMessage({ type: "end", streamId: data.streamId });
         } else if (fallbackParser) {
             fallbackEndPending = true;

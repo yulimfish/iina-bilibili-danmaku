@@ -31,6 +31,7 @@ function loadMainFixture(options = {}) {
     const overlayMessages = [];
     const sidebarMessages = [];
     const clock = { now: 0 };
+    let setClickableCalls = 0;
     const defaultXml = '<i><d p="1,1,25,1,1,0,h,1">' +
         "x".repeat(128 * 1024 + 20) + "</d></i>";
     const xmls = options.xmls || [defaultXml];
@@ -38,7 +39,10 @@ function loadMainFixture(options = {}) {
     let danmakuRequestCount = 0;
 
     const sidebar = {
-        loadFile() {},
+        loadFile() {
+            // IINA's sidebar.loadFile clears message listeners registered before it.
+            Object.keys(sidebarHandlers).forEach((key) => delete sidebarHandlers[key]);
+        },
         onMessage(name, handler) { sidebarHandlers[name] = handler; },
         postMessage(name, data) {
             if (options.sidebarPostMessage) options.sidebarPostMessage(name, data);
@@ -71,7 +75,7 @@ function loadMainFixture(options = {}) {
                 }, 0);
             }
         },
-        setClickable() {},
+        setClickable() { setClickableCalls += 1; },
         show() {},
         hide() {},
         setOpacity() {}
@@ -110,7 +114,10 @@ function loadMainFixture(options = {}) {
         setTimeout,
         clearTimeout,
         iina: {
-            core: { window: { loaded: true }, status: { idle: false } },
+            core: {
+                window: { loaded: options.windowLoadedInitially !== false },
+                status: { idle: false }
+            },
             console,
             menu: {
                 item() { return { addSubMenuItem() {} }; },
@@ -137,7 +144,11 @@ function loadMainFixture(options = {}) {
     vm.runInContext(fs.readFileSync(
         path.join(__dirname, "..", "main.js"), "utf8"
     ), context);
-    return { eventHandlers, sidebarHandlers, overlayHandlers, overlayMessages, sidebarMessages, clock, xmls };
+    return {
+        eventHandlers, sidebarHandlers, overlayHandlers, overlayMessages, sidebarMessages,
+        clock, xmls, core: context.iina.core,
+        get setClickableCalls() { return setClickableCalls; }
+    };
 }
 
 test("main streams bounded chunks and throttles ordinary time updates", async () => {
@@ -205,6 +216,14 @@ test("main waits for each overlay chunk acknowledgement before sending the next"
         message.name === "stream-end" && message.data.streamId === stream.data.streamId
     ), true);
     assert.equal(streamChunks().map((message) => message.data.chunk).join(""), xml);
+});
+
+test("touches the overlay view only after it reports ready", async () => {
+    const fixture = loadMainFixture();
+    await fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
+    await wait(30);
+
+    assert.equal(fixture.setClickableCalls, 1);
 });
 
 test("includes the playback offset in the first stream timestamp", async () => {
@@ -354,6 +373,24 @@ test("cancels the current stream before a bangumi search starts", async () => {
     await fixture.sidebarHandlers["search-bangumi"]({ keyword: "demo" });
 
     assert.equal(fixture.overlayMessages.filter((message) => message.name === "clear").length, clearCount + 1);
+});
+
+test("keeps danmaku source handlers alive when the sidebar page loads late", async () => {
+    const fixture = loadMainFixture({
+        windowLoadedInitially: false,
+        httpGet(url) {
+            if (!url.includes("/x/web-interface/search/type")) return undefined;
+            return searchResponse("Demo");
+        }
+    });
+
+    fixture.core.window.loaded = true;
+    fixture.eventHandlers["iina.window-loaded"]();
+
+    assert.equal(typeof fixture.sidebarHandlers["load-source"], "function");
+    assert.equal(typeof fixture.sidebarHandlers["search-bangumi"], "function");
+    await fixture.sidebarHandlers["search-bangumi"]({ keyword: "demo" });
+    assert.equal(fixture.sidebarMessages.filter((message) => message.name === "seasons").length, 1);
 });
 
 test("coalesces repeated pending searches for the same normalized keyword", async () => {

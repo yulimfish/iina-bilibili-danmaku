@@ -74,7 +74,7 @@
         if (!pMatch) return null;
         if (pMatch[1].includes("<") || hasInvalidXmlEntities(pMatch[1])) return null;
         const params = decodeXmlEntities(pMatch[1]).split(",");
-        if (params.length !== 8) return null;
+        if (params.length < 8) return null;
 
         const rawTime = String(params[0] || "");
         if (!/^\d+(?:\.\d+)?$/.test(rawTime)) {
@@ -104,8 +104,11 @@
             .replace(/\u25a0/g, "\u2588");
         const date = parseInteger(params[4]);
         const pool = parseInteger(params[5]);
-        const dbid = parseInteger(params[7]);
-        if (date === null || pool === null || dbid === null) return null;
+        const rawDbid = String(params[7] || "");
+        if (date === null || pool === null || !/^\d+$/.test(rawDbid)) return null;
+        // dbid is a 64-bit id that may exceed Number.MAX_SAFE_INTEGER; keep the
+        // same parseInt semantics as CommentCoreLibrary.
+        const dbid = parseInt(rawDbid, 10);
         const comment = {
             stime: normalizedStime,
             size: size,

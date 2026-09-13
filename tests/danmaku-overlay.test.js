@@ -279,6 +279,80 @@ test("fallback acknowledges a main chunk after all slices are parsed", async () 
     ).length, 1);
 });
 
+test("overlay falls back when the worker fails before parsing anything", async () => {
+    const fixture = loadOverlay();
+    fixture.send("stream-start", {
+        streamId: 30,
+        title: "Worker failure",
+        settings: { fontSize: 25, speed: 680, showTop: true, showBottom: true },
+        initialTime: 0
+    });
+    fixture.send("stream-chunk", {
+        streamId: 30,
+        chunkId: 0,
+        chunk: '<d p="2.5,1,25,1,1,0,h,1">alpha</d>'
+    });
+    fixture.workers[0].onerror({ message: "worker script failed" });
+    await wait(20);
+    fixture.send("stream-chunk", {
+        streamId: 30,
+        chunkId: 1,
+        chunk: '<d p="2.8,1,25,1,1,0,h,2">beta</d>'
+    });
+    fixture.send("stream-end", { streamId: 30 });
+    await wait(20);
+    fixture.send("time", { time: 3 });
+
+    assert.deepEqual(JSON.parse(JSON.stringify(
+        fixture.manager.sendCalls.flatMap((batch) => batch.map((comment) => comment.text))
+    )), ["alpha", "beta"]);
+    assert.deepEqual(fixture.outgoing
+        .filter((message) => message.name === "stream-chunk-consumed" && message.data.streamId === 30)
+        .map((message) => message.data.chunkId), [0, 1]);
+    assert.equal(fixture.outgoing.some((message) =>
+        message.name === "stream-state" && message.data.phase === "error"
+    ), false);
+});
+
+test("completes an empty stream when the worker dies after end was forwarded", async () => {
+    const fixture = loadOverlay();
+    fixture.send("stream-start", {
+        streamId: 40,
+        title: "Empty worker death",
+        settings: { fontSize: 25, speed: 680, showTop: true, showBottom: true },
+        initialTime: 0
+    });
+    fixture.send("stream-end", { streamId: 40 });
+    fixture.workers[0].onerror({ message: "worker script failed" });
+    await wait(20);
+
+    assert.equal(fixture.outgoing.some((message) =>
+        message.name === "stream-state" && message.data.phase === "empty"
+    ), true);
+    assert.equal(fixture.outgoing.some((message) =>
+        message.name === "stream-state" && message.data.phase === "error"
+    ), false);
+});
+
+test("reports a fatal error when the worker fails after producing output", async () => {
+    const fixture = loadOverlay();
+    fixture.send("stream-start", {
+        streamId: 41,
+        title: "Worker crash",
+        settings: { fontSize: 25, speed: 680, showTop: true, showBottom: true },
+        initialTime: 0
+    });
+    fixture.workers[0].emit({
+        type: "progress", streamId: 41, parsed: 1, accepted: 0, skipped: 0
+    });
+    fixture.workers[0].onerror({ message: "worker crashed" });
+    await wait(20);
+
+    assert.equal(fixture.outgoing.some((message) =>
+        message.name === "stream-state" && message.data.phase === "error"
+    ), true);
+});
+
 test("overlay does not advance CCL while a stream is paused", () => {
     const fixture = loadOverlay();
     fixture.send("stream-start", {

@@ -25,6 +25,22 @@ test("parses supported Bilibili fields into CCL data", () => {
     });
 });
 
+test("parses modern 9-parameter records with 64-bit dbid values", () => {
+    const comment = parseCommentToken(
+        '<d p="1350.23800,5,25,41194,1719800846,0,ee45ef1c,1618030297100649984,10">前方富冈义勇大型语言艺术现场</d>'
+    );
+
+    assert.equal(comment.stime, 1350238);
+    assert.equal(comment.mode, 5);
+    assert.equal(comment.size, 25);
+    assert.equal(comment.color, 41194);
+    assert.equal(comment.date, 1719800846);
+    assert.equal(comment.pool, 0);
+    assert.equal(comment.hash, "ee45ef1c");
+    assert.equal(comment.dbid, 1618030297100649984);
+    assert.equal(comment.text, "前方富冈义勇大型语言艺术现场");
+});
+
 test("decodes XML entities and normalizes Bilibili newlines", () => {
     const comment = parseCommentToken(
         '<d p="2,4,25,16777215,1,0,h,2">&lt;hi&gt;&amp;one/n two\\ntwo\r\nthree</d>'
