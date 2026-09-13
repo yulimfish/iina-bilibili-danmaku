@@ -229,6 +229,56 @@ test("overlay falls back to time-sliced parsing when Worker is unavailable", asy
     ), true);
 });
 
+test("overlay forwards worker chunk acknowledgements to main", () => {
+    const fixture = loadOverlay();
+    fixture.send("stream-start", {
+        streamId: 22,
+        title: "Worker acknowledgement",
+        settings: { fontSize: 25, speed: 680, showTop: true, showBottom: true },
+        initialTime: 0
+    });
+    fixture.send("stream-chunk", {
+        streamId: 22,
+        chunkId: 5,
+        chunk: '<d p="1,1,25,1,1,0,h,1">ready</d>'
+    });
+
+    const forwarded = fixture.workers[0].lastMessage;
+    assert.equal(forwarded.type, "chunk");
+    assert.equal(forwarded.chunkId, 5);
+    fixture.workers[0].emit({
+        type: "chunk-consumed",
+        streamId: forwarded.streamId,
+        chunkId: forwarded.chunkId
+    });
+
+    assert.equal(fixture.outgoing.some((message) =>
+        message.name === "stream-chunk-consumed" && message.data.streamId === 22 &&
+        message.data.chunkId === 5
+    ), true);
+});
+
+test("fallback acknowledges a main chunk after all slices are parsed", async () => {
+    const fixture = loadOverlay({ disableWorker: true });
+    fixture.send("stream-start", {
+        streamId: 23,
+        title: "Fallback acknowledgement",
+        settings: { fontSize: 25, speed: 680, showTop: true, showBottom: true },
+        initialTime: 0
+    });
+    fixture.send("stream-chunk", {
+        streamId: 23,
+        chunkId: 6,
+        chunk: " ".repeat(16 * 1024) + '<d p="1,1,25,1,1,0,h,1">ready</d>'
+    });
+
+    await wait(20);
+    assert.equal(fixture.outgoing.filter((message) =>
+        message.name === "stream-chunk-consumed" && message.data.streamId === 23 &&
+        message.data.chunkId === 6
+    ).length, 1);
+});
+
 test("overlay does not advance CCL while a stream is paused", () => {
     const fixture = loadOverlay();
     fixture.send("stream-start", {

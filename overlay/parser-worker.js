@@ -31,6 +31,9 @@ self.onmessage = (event) => {
         if (data.type === "chunk") {
             const stats = parser.push(data.chunk || "");
             report("progress", data.streamId, stats);
+            report("chunk-consumed", data.streamId, Object.assign({
+                chunkId: data.chunkId
+            }, stats));
         } else if (data.type === "end") {
             const stats = parser.finish();
             report("complete", data.streamId, stats);

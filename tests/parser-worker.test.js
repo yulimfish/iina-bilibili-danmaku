@@ -61,6 +61,23 @@ test("worker drops queued input after cancellation", () => {
     assert.equal(messages.some((message) => message.type === "complete"), false);
 });
 
+test("worker acknowledges a chunk only after parsing it", () => {
+    const { context, messages } = loadWorker();
+
+    context.onmessage({ data: { type: "start", streamId: 13 } });
+    context.onmessage({ data: {
+        type: "chunk", streamId: 13, chunkId: 4,
+        chunk: '<d p="1,1,25,1,1,0,h,1">ready</d>'
+    } });
+
+    const commentsIndex = messages.findIndex((message) => message.type === "comments");
+    const consumedIndex = messages.findIndex((message) => message.type === "chunk-consumed");
+    assert.equal(commentsIndex >= 0, true);
+    assert.equal(consumedIndex > commentsIndex, true);
+    assert.equal(messages[consumedIndex].streamId, 13);
+    assert.equal(messages[consumedIndex].chunkId, 4);
+});
+
 test("worker emits out-of-order records before stream completion", () => {
     const { context, messages } = loadWorker();
     const xml =

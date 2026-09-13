@@ -8,6 +8,22 @@ function wait(milliseconds = 0) {
     return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+function deferred() {
+    let resolve;
+    const promise = new Promise((next) => { resolve = next; });
+    return { promise, resolve };
+}
+
+function searchResponse(title, seasonId = 1) {
+    return {
+        statusCode: 200,
+        text: JSON.stringify({
+            code: 0,
+            data: { result: [{ season_id: seasonId, title, pubtime: 0 }] }
+        })
+    };
+}
+
 function loadMainFixture(options = {}) {
     const eventHandlers = {};
     const sidebarHandlers = {};
@@ -24,7 +40,10 @@ function loadMainFixture(options = {}) {
     const sidebar = {
         loadFile() {},
         onMessage(name, handler) { sidebarHandlers[name] = handler; },
-        postMessage(name, data) { sidebarMessages.push({ name, data }); },
+        postMessage(name, data) {
+            if (options.sidebarPostMessage) options.sidebarPostMessage(name, data);
+            sidebarMessages.push({ name, data });
+        },
         show() {},
         hide() {}
     };
@@ -41,6 +60,15 @@ function loadMainFixture(options = {}) {
             overlayMessages.push({ name, data });
             if (name === "ping" && overlayHandlers["overlay-ready"]) {
                 overlayHandlers["overlay-ready"]({});
+            } else if (name === "stream-chunk" && options.autoAcknowledgeChunks !== false) {
+                setTimeout(() => {
+                    if (overlayHandlers["stream-chunk-consumed"]) {
+                        overlayHandlers["stream-chunk-consumed"]({
+                            streamId: data.streamId,
+                            chunkId: data.chunkId
+                        });
+                    }
+                }, 0);
             }
         },
         setClickable() {},
@@ -49,7 +77,13 @@ function loadMainFixture(options = {}) {
         setOpacity() {}
     };
     const http = {
-        async get(url) {
+        async get(url, request) {
+            if (options.httpGet) {
+                const response = options.httpGet(url, request);
+                if (response !== undefined) {
+                    return await response;
+                }
+            }
             if (url.includes("/x/web-interface/view")) {
                 videoRequestCount += 1;
                 return {
@@ -96,6 +130,9 @@ function loadMainFixture(options = {}) {
             }
         }
     };
+    if (options.parseJson) {
+        context.JSON = { parse: options.parseJson, stringify: JSON.stringify };
+    }
     vm.createContext(context);
     vm.runInContext(fs.readFileSync(
         path.join(__dirname, "..", "main.js"), "utf8"
@@ -128,6 +165,46 @@ test("main streams bounded chunks and throttles ordinary time updates", async ()
     fixture.clock.now = 1033;
     fixture.eventHandlers["mpv.time-pos.changed"](10.05);
     assert.equal(fixture.overlayMessages.filter((message) => message.name === "time").length, 2);
+});
+
+test("main waits for each overlay chunk acknowledgement before sending the next", async () => {
+    const xml = "x".repeat(128 * 1024 * 2 + 20);
+    const fixture = loadMainFixture({ xmls: [xml], autoAcknowledgeChunks: false });
+    await fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
+    await wait(10);
+
+    const stream = fixture.overlayMessages.find((message) => message.name === "stream-start");
+    const streamChunks = () => fixture.overlayMessages.filter((message) =>
+        message.name === "stream-chunk" && message.data.streamId === stream.data.streamId
+    );
+    assert.equal(streamChunks().length, 1);
+    assert.equal(fixture.overlayMessages.some((message) =>
+        message.name === "stream-end" && message.data.streamId === stream.data.streamId
+    ), false);
+
+    const firstChunkId = streamChunks()[0].data.chunkId;
+    assert.equal(firstChunkId, 0);
+    fixture.overlayHandlers["stream-chunk-consumed"]({
+        streamId: stream.data.streamId, chunkId: firstChunkId
+    });
+    assert.equal(streamChunks().length, 2);
+    fixture.overlayHandlers["stream-chunk-consumed"]({
+        streamId: stream.data.streamId, chunkId: firstChunkId
+    });
+    assert.equal(streamChunks().length, 2);
+    const secondChunkId = streamChunks()[1].data.chunkId;
+    fixture.overlayHandlers["stream-chunk-consumed"]({
+        streamId: stream.data.streamId, chunkId: secondChunkId
+    });
+    assert.equal(streamChunks().length, 3);
+    const thirdChunkId = streamChunks()[2].data.chunkId;
+    fixture.overlayHandlers["stream-chunk-consumed"]({
+        streamId: stream.data.streamId, chunkId: thirdChunkId
+    });
+    assert.equal(fixture.overlayMessages.some((message) =>
+        message.name === "stream-end" && message.data.streamId === stream.data.streamId
+    ), true);
+    assert.equal(streamChunks().map((message) => message.data.chunk).join(""), xml);
 });
 
 test("includes the playback offset in the first stream timestamp", async () => {
@@ -277,6 +354,80 @@ test("cancels the current stream before a bangumi search starts", async () => {
     await fixture.sidebarHandlers["search-bangumi"]({ keyword: "demo" });
 
     assert.equal(fixture.overlayMessages.filter((message) => message.name === "clear").length, clearCount + 1);
+});
+
+test("coalesces repeated pending searches for the same normalized keyword", async () => {
+    const response = deferred();
+    let searchRequests = 0;
+    const fixture = loadMainFixture({
+        httpGet(url) {
+            if (!url.includes("/x/web-interface/search/type")) return undefined;
+            searchRequests += 1;
+            return response.promise;
+        }
+    });
+
+    const first = fixture.sidebarHandlers["search-bangumi"]({ keyword: "demo" });
+    const second = fixture.sidebarHandlers["search-bangumi"]({ keyword: "  demo  " });
+    assert.equal(searchRequests, 1);
+    response.resolve(searchResponse("Demo"));
+    await Promise.all([first, second]);
+    assert.equal(fixture.sidebarMessages.filter((message) => message.name === "seasons").length, 1);
+});
+
+test("drops stale search responses before parsing their JSON", async () => {
+    const oldResponse = deferred();
+    const latestResponse = deferred();
+    let parseCalls = 0;
+    const fixture = loadMainFixture({
+        parseJson(text) {
+            parseCalls += 1;
+            return JSON.parse(text);
+        },
+        httpGet(url, request) {
+            if (!url.includes("/x/web-interface/search/type")) return undefined;
+            return request.params.keyword === "old" ? oldResponse.promise : latestResponse.promise;
+        }
+    });
+
+    const oldSearch = fixture.sidebarHandlers["search-bangumi"]({ keyword: "old" });
+    const latestSearch = fixture.sidebarHandlers["search-bangumi"]({ keyword: "latest" });
+    oldResponse.resolve(searchResponse("Old", 1));
+    await oldSearch;
+    assert.equal(parseCalls, 0);
+
+    latestResponse.resolve(searchResponse("Latest", 2));
+    await latestSearch;
+    assert.equal(parseCalls, 1);
+    const seasons = fixture.sidebarMessages.filter((message) => message.name === "seasons");
+    assert.equal(seasons.length, 1);
+    assert.equal(seasons[0].data.seasons[0].title, "Latest");
+});
+
+test("releases a coalesced search after its promise rejects", async () => {
+    let searchRequests = 0;
+    let throwFromErrorMessage = true;
+    const fixture = loadMainFixture({
+        sidebarPostMessage(name) {
+            if (name === "error" && throwFromErrorMessage) {
+                throwFromErrorMessage = false;
+                throw new Error("sidebar unavailable");
+            }
+        },
+        httpGet(url) {
+            if (!url.includes("/x/web-interface/search/type")) return undefined;
+            searchRequests += 1;
+            if (searchRequests === 1) return Promise.reject(new Error("network failed"));
+            return searchResponse("Recovered");
+        }
+    });
+
+    await assert.rejects(
+        fixture.sidebarHandlers["search-bangumi"]({ keyword: "demo" }),
+        /sidebar unavailable/
+    );
+    await fixture.sidebarHandlers["search-bangumi"]({ keyword: "demo" });
+    assert.equal(searchRequests, 2);
 });
 
 test("cancels the current stream before a different part starts", async () => {

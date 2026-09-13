@@ -283,6 +283,11 @@ function handleWorkerMessage(event) {
         appendComments(data.streamId, data.comments, data);
     } else if (data.type === "progress") {
         reportProgress(data);
+    } else if (data.type === "chunk-consumed") {
+        iina.postMessage("stream-chunk-consumed", {
+            streamId: data.streamId,
+            chunkId: data.chunkId
+        });
     } else if (data.type === "complete") {
         completeStream(data.streamId, data);
     } else if (data.type === "error") {
@@ -320,11 +325,17 @@ function runFallbackPump(token) {
     if (token !== fallbackPumpToken || !fallbackParser) {
         return;
     }
-    const chunk = fallbackQueue.shift();
-    if (chunk) {
+    const entry = fallbackQueue.shift();
+    if (entry) {
         try {
-            const stats = fallbackParser.push(chunk);
+            const stats = fallbackParser.push(entry.chunk);
             reportProgress(stats);
+            if (entry.acknowledge) {
+                iina.postMessage("stream-chunk-consumed", {
+                    streamId: activeStreamId,
+                    chunkId: entry.chunkId
+                });
+            }
         } catch (error) {
             handleParserError(activeStreamId, String((error && error.message) || error));
             return;
@@ -436,13 +447,18 @@ iina.onMessage("stream-chunk", (data) => {
             parserWorker.postMessage({
                 type: "chunk",
                 streamId: data.streamId,
+                chunkId: data.chunkId,
                 chunk: data.chunk
             });
             return;
         }
         if (fallbackParser) {
             for (let offset = 0; offset < data.chunk.length; offset += FALLBACK_CHUNK_SIZE) {
-                fallbackQueue.push(data.chunk.slice(offset, offset + FALLBACK_CHUNK_SIZE));
+                fallbackQueue.push({
+                    chunk: data.chunk.slice(offset, offset + FALLBACK_CHUNK_SIZE),
+                    acknowledge: offset + FALLBACK_CHUNK_SIZE >= data.chunk.length,
+                    chunkId: data.chunkId
+                });
             }
             scheduleFallbackPump();
         }

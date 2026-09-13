@@ -96,9 +96,11 @@ let pendingStream = null; // load arrived before overlay webview was ready
 let nextStreamId = 0;
 let currentStreamId = 0;
 let streamPumpGeneration = 0;
+let acknowledgeStreamChunk = null;
 let danmakuActive = false;
 let streamLoading = false;
 let loadToken = 0; // guards against overlapping loadSource calls
+let pendingSearch = null;
 let latestPlaybackTime = null;
 let lastSentPlaybackTime = null;
 let lastTimeSentAt = 0;
@@ -184,13 +186,16 @@ function extractBvid(text) {
     return m ? m[0] : null;
 }
 
-async function biliApi(path, params, extraHeaders) {
+async function biliApi(path, params, extraHeaders, isStale) {
     const headers = Object.assign({}, BILI_HEADERS, extraHeaders || {});
     const res = await http.get("https://api.bilibili.com" + path, {
         params: params,
         headers: headers,
         data: {}
     });
+    if (isStale && isStale()) {
+        return null;
+    }
     if (res.statusCode !== 200) {
         throw { network: true, status: res.statusCode };
     }
@@ -362,8 +367,9 @@ async function searchBangumi(keyword, token) {
             {
                 "Referer": "https://search.bilibili.com/",
                 "Cookie": "buvid3=" + getBuvid()
-            });
-        if (token !== loadToken) {
+            },
+            () => token !== loadToken);
+        if (data === null || token !== loadToken) {
             return;
         }
         const seasons = (data.result || []).map((r) => ({
@@ -383,6 +389,23 @@ async function searchBangumi(keyword, token) {
             reportError(e);
         }
     }
+}
+
+function requestBangumiSearch(keyword) {
+    const normalizedKeyword = (keyword || "").trim();
+    if (pendingSearch && pendingSearch.keyword === normalizedKeyword) {
+        return pendingSearch.promise;
+    }
+    const token = invalidateCurrentLoad();
+    const promise = searchBangumi(normalizedKeyword, token);
+    pendingSearch = { keyword: normalizedKeyword, promise: promise };
+    const clearPendingSearch = () => {
+        if (pendingSearch && pendingSearch.promise === promise) {
+            pendingSearch = null;
+        }
+    };
+    promise.then(clearPendingSearch, clearPendingSearch);
+    return promise;
 }
 
 async function loadSeasonById(seasonId, token, epId) {
@@ -460,6 +483,7 @@ async function loadBangumiLink(link, token) {
 
 function cancelOverlayStream() {
     streamPumpGeneration += 1;
+    acknowledgeStreamChunk = null;
     pendingStream = null;
     currentStreamId = 0;
     lastSentPlaybackTime = null;
@@ -468,6 +492,7 @@ function cancelOverlayStream() {
 
 function invalidateCurrentLoad() {
     loadToken += 1;
+    pendingSearch = null;
     cancelOverlayStream();
     danmakuActive = false;
     if (overlayLoaded) {
@@ -480,6 +505,8 @@ function startOverlayStream(payload) {
     const generation = ++streamPumpGeneration;
     let xml = payload.xml || "";
     let offset = 0;
+    let nextChunkId = 0;
+    let waitingForChunkId = null;
 
     sidebar.postMessage("status", { text: "弹幕数据已下载，正在传输…" });
     if (settings.enabled) {
@@ -501,19 +528,34 @@ function startOverlayStream(payload) {
             payload.streamId !== currentStreamId) {
             return;
         }
+        if (waitingForChunkId !== null) {
+            return;
+        }
         if (offset >= xml.length) {
+            acknowledgeStreamChunk = null;
             overlay.postMessage("stream-end", { streamId: payload.streamId });
             xml = "";
             return;
         }
         const chunk = xml.slice(offset, offset + XML_CHUNK_SIZE);
         offset += chunk.length;
+        const chunkId = nextChunkId;
+        nextChunkId += 1;
+        waitingForChunkId = chunkId;
         overlay.postMessage("stream-chunk", {
             streamId: payload.streamId,
+            chunkId: chunkId,
             chunk: chunk
         });
-        setTimeout(pump, 0);
     }
+    acknowledgeStreamChunk = (streamId, chunkId) => {
+        if (streamId !== payload.streamId || generation !== streamPumpGeneration ||
+            chunkId !== waitingForChunkId) {
+            return;
+        }
+        waitingForChunkId = null;
+        pump();
+    };
     pump();
 }
 
@@ -546,8 +588,7 @@ sidebar.onMessage("load-source", (data) => {
     return loadSource(data && data.text);
 });
 sidebar.onMessage("search-bangumi", (data) => {
-    const token = invalidateCurrentLoad();
-    return searchBangumi(data && data.keyword, token);
+    return requestBangumiSearch(data && data.keyword);
 });
 sidebar.onMessage("select-season", (data) => {
     if (!data || !data.season_id) {
@@ -591,6 +632,11 @@ event.on("iina.plugin-overlay-loaded", () => {
                 startOverlayStream(stream);
             } else if (danmakuActive && latestPlaybackTime !== null) {
                 syncPlaybackTime(latestPlaybackTime, true);
+            }
+        });
+        overlay.onMessage("stream-chunk-consumed", (data) => {
+            if (data && acknowledgeStreamChunk) {
+                acknowledgeStreamChunk(data.streamId, data.chunkId);
             }
         });
         overlay.onMessage("stream-state", (data) => {
