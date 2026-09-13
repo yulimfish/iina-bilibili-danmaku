@@ -447,7 +447,12 @@ async function loadSeasonById(seasonId, token, epId) {
         if (token !== loadToken) {
             return;
         }
-        const episodes = result.episodes || [];
+        const episodes = (result.episodes || []).slice();
+        (result.section || []).forEach((section) => {
+            if (section && Array.isArray(section.episodes)) {
+                episodes.push(...section.episodes);
+            }
+        });
         if (!episodes.length) {
             throw { biliCode: -404, biliMessage: "该剧集无可播分集（可能地区受限）" };
         }
@@ -458,7 +463,7 @@ async function loadSeasonById(seasonId, token, epId) {
                 page: e.title,
                 part: e.long_title,
                 cid: e.cid,
-                ep: e.id,
+                ep: e.id !== undefined ? e.id : e.ep_id,
                 badge: e.badge
             })),
             index: -1
@@ -468,7 +473,8 @@ async function loadSeasonById(seasonId, token, epId) {
             // Direct ep link: jump straight to that episode.
             let idx = video.parts.findIndex((p) => String(p.ep) === String(epId));
             if (idx < 0) {
-                idx = 0;
+                sidebar.postMessage("error", { message: "目标分集不在当前剧集列表中" });
+                return;
             }
             pushPartsToSidebar();
             await loadPart(idx, token);

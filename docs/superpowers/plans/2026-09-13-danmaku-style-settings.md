@@ -1,0 +1,139 @@
+# 弹幕字体与样式设置实施计划
+
+> **执行要求：** 实施时使用 `executing-plans` skill，逐项完成下列复选框；任何一项未通过验证都保持 `- [ ]`。
+
+**目标：** 在现有字号、透明度、速度和位置过滤之外，支持选择弹幕字体并调整描边宽度，设置持久化且对新弹幕与在屏弹幕即时生效。
+
+**架构：** 侧边栏只提供可控的字体预设和 `0-3px` 描边宽度，`main.js` 负责白名单规范化、preferences 持久化及消息同步，`overlay/danmaku.js` 使用 CCL 的 `comment.font` 设置字体，并通过项目级 CSS 变量覆盖描边。第三方 CCL 与解析器保持不变。
+
+**技术栈：** IINA Sidebar WKWebView、IINA preferences、CommentCoreLibrary、CSS custom properties、Node.js `node:test`。
+
+## 全局约束
+
+- 首期样式范围固定为字体预设与描边宽度；已有字号、透明度、速度、顶部/底部和显示开关保持兼容。
+- 字体只允许 `system`、`sans`、`serif`、`rounded`、`mono` 五个预设，不接受任意 CSS 字符串或网络字体。
+- 描边范围为 `0-3px`，步长 `0.5px`，默认 `1px`。
+- 不覆盖 B 站弹幕自身颜色，不重新解析 XML，不重建 Worker 或 CommentManager。
+- 不修改 `overlay/vendor/CommentCoreLibrary.js` 与 `overlay/vendor/ccl.min.css`。
+- 所有旧 settings 数据必须通过默认值合并升级，不需要迁移脚本。
+
+## 文件映射
+
+- 修改：`sidebar/index.html`，增加字体和描边控件。
+- 修改：`main.js`，规范化、持久化和同步设置。
+- 修改：`overlay/danmaku.html`，增加后置 CSS 变量覆盖。
+- 修改：`overlay/danmaku.js`，将字体与描边应用到渲染层。
+- 修改：`tests/main-stream.test.js`、`tests/danmaku-overlay.test.js`。
+- 新增：`tests/sidebar-settings.test.js`，验证 sidebar 设置消息和回填。
+
+---
+
+### Task 1：锁定设置模型与校验边界
+
+**接口：**
+
+```js
+const FONT_PRESETS = {
+    system: '-apple-system, "PingFang SC", "Microsoft YaHei", sans-serif',
+    sans: 'Arial, "Helvetica Neue", sans-serif',
+    serif: 'Songti SC, "STSong", serif',
+    rounded: '"Hiragino Maru Gothic ProN", "Arial Rounded MT Bold", sans-serif',
+    mono: 'Menlo, Monaco, monospace'
+};
+
+// Persisted settings additions
+{ fontFamily: "system", strokeWidth: 1 }
+```
+
+- [ ] 在 `tests/main-stream.test.js` 添加失败测试：旧 settings 自动获得默认字体/描边；合法值保留；非法字体回退 `system`；描边被夹在 `0-3`。
+- [ ] 在 `main.js` 的 `DEFAULT_SETTINGS` 增加 `fontFamily` 与 `strokeWidth`。
+- [ ] 新增 `normalizeSettings(candidate)`，只复制已知键，并对布尔值、数值范围、字体枚举做规范化；`loadSettings()` 和 `applySettings()` 都通过它更新状态。
+- [ ] 扩展 `overlaySettings()` 与实时 `style` payload：
+
+```js
+{
+    speed: settings.speed,
+    fontSize: settings.fontSize,
+    fontFamily: settings.fontFamily,
+    strokeWidth: settings.strokeWidth,
+    showTop: settings.showTop,
+    showBottom: settings.showBottom
+}
+```
+
+- [ ] 运行 `node --test tests/main-stream.test.js`，预期设置升级、校验、持久化和消息测试全部通过。
+
+### Task 2：增加侧边栏设置控件
+
+- [ ] 新建 `tests/sidebar-settings.test.js` 的最小 DOM/IINA fixture，先写失败测试：首次回填、字体 change patch、描边 change patch、显示标签同步。
+- [ ] 在 `sidebar/index.html` 的字号之后加入：
+
+```html
+<label class="opt">字体
+  <select id="set-font-family">
+    <option value="system">系统默认</option>
+    <option value="sans">无衬线</option>
+    <option value="serif">宋体</option>
+    <option value="rounded">圆体</option>
+    <option value="mono">等宽</option>
+  </select>
+</label>
+<label class="opt">描边 <span id="val-stroke">1px</span>
+  <input type="range" id="set-stroke" min="0" max="3" step="0.5" value="1">
+</label>
+```
+
+- [ ] 扩展 `ctl`、`patchFromUI()`、`refreshValueLabels()` 和 `settings` 回填，确保每次只提交发生变化的单个 key。
+- [ ] 为 `select` 添加与现有 input 一致的深色样式，但不改变现有页面结构和 tab 行为。
+- [ ] 运行 `node --test tests/sidebar-settings.test.js`，预期控件消息与回填测试全部通过。
+
+### Task 3：实时应用字体
+
+- [ ] 在 `tests/danmaku-overlay.test.js` 添加失败测试：首批、后续批次、`cm.timeline` 与 `cm.runline` 都使用最新字体；字体变化不创建新 Worker/manager。
+- [ ] 扩展 overlay 状态：
+
+```js
+let ov = {
+    speed: 680,
+    fontSize: 25,
+    fontFamily: "system",
+    strokeWidth: 1,
+    showTop: true,
+    showBottom: true
+};
+```
+
+- [ ] 新增 `resolveFontFamily(preset)` 与 `applyFontFamily()`，通过 CCL 的 `comment.font` setter 同时更新 `cm.timeline` 和 `cm.runline`。
+- [ ] 在 `appendComments()` 中为每条新 comment 设置 `font`；在 `updateSettings()` 和 `style` handler 中只在字体实际变化时调用 `applyFontFamily()`。
+- [ ] 运行 `node --test tests/danmaku-overlay.test.js`，预期字体即时应用且不触发重解析。
+
+### Task 4：用 CSS 变量应用描边
+
+- [ ] 扩展 overlay 测试 document fixture，使 `document.documentElement.style.setProperty()` 可观测；添加失败测试验证 `--danmaku-stroke-width`。
+- [ ] 在 `overlay/danmaku.html` 的 vendor CSS 之后加入项目级覆盖：
+
+```css
+.abp .container .cmt {
+  -webkit-text-stroke-width: var(--danmaku-stroke-width, 1px);
+}
+```
+
+- [ ] 新增 `applyStrokeWidth()`：
+
+```js
+document.documentElement.style.setProperty(
+    "--danmaku-stroke-width",
+    ov.strokeWidth + "px"
+);
+```
+
+- [ ] `stream-start` 和实时 `style` 消息都调用描边应用；只改描边不得调用 `resize()`、重启 Worker 或重置 manager。
+- [ ] 运行 `node --test tests/danmaku-overlay.test.js tests/sidebar-settings.test.js`，预期描边和 sidebar 测试全部通过。
+
+### Task 5：完整验证
+
+- [ ] 运行 `node --test tests/*.test.js`，预期 0 失败。
+- [ ] 运行 `node --check main.js && node --check overlay/danmaku.js`，预期全部退出码为 0。
+- [ ] 在 IINA 1.4.4 实机逐个切换五个字体预设和 `0/0.5/1/2/3px` 描边，确认在屏弹幕立即变化、彩色弹幕颜色保留、播放和解析不中断。
+- [ ] 重启 IINA，确认字体与描边持久化；旧版 settings 自动补齐默认值。
+- [ ] 运行全新 `goal-verify` 只读审计，覆盖需求、逻辑、边界、代码质量、测试有效性和实机结果。

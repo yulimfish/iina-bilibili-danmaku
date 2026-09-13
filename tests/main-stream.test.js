@@ -32,6 +32,8 @@ function loadMainFixture(options = {}) {
     const sidebarMessages = [];
     const clock = { now: 0 };
     let setClickableCalls = 0;
+    let savedSettings = null;
+    let preferenceSyncCalls = 0;
     const defaultXml = '<i><d p="1,1,25,1,1,0,h,1">' +
         "x".repeat(128 * 1024 + 20) + "</d></i>";
     const xmls = options.xmls || [defaultXml];
@@ -62,7 +64,8 @@ function loadMainFixture(options = {}) {
         onMessage(name, handler) { overlayHandlers[name] = handler; },
         postMessage(name, data) {
             overlayMessages.push({ name, data });
-            if (name === "ping" && overlayHandlers["overlay-ready"]) {
+            if (name === "ping" && overlayHandlers["overlay-ready"] &&
+                options.manualOverlayReady !== true) {
                 overlayHandlers["overlay-ready"]({});
             } else if (name === "stream-chunk" && options.autoAcknowledgeChunks !== false) {
                 setTimeout(() => {
@@ -131,9 +134,11 @@ function loadMainFixture(options = {}) {
             mpv: {},
             http,
             preferences: {
-                get() { return options.settings || null; },
-                set() {},
-                sync() {}
+                get(key) { return key === "settings" ? options.settings || null : null; },
+                set(key, value) {
+                    if (key === "settings") savedSettings = value;
+                },
+                sync() { preferenceSyncCalls += 1; }
             }
         }
     };
@@ -147,7 +152,9 @@ function loadMainFixture(options = {}) {
     return {
         eventHandlers, sidebarHandlers, overlayHandlers, overlayMessages, sidebarMessages,
         clock, xmls, core: context.iina.core,
-        get setClickableCalls() { return setClickableCalls; }
+        get setClickableCalls() { return setClickableCalls; },
+        get savedSettings() { return savedSettings; },
+        get preferenceSyncCalls() { return preferenceSyncCalls; }
     };
 }
 
@@ -219,10 +226,12 @@ test("main waits for each overlay chunk acknowledgement before sending the next"
 });
 
 test("touches the overlay view only after it reports ready", async () => {
-    const fixture = loadMainFixture();
+    const fixture = loadMainFixture({ manualOverlayReady: true });
     await fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
-    await wait(30);
+    await wait(10);
 
+    assert.equal(fixture.setClickableCalls, 0);
+    fixture.overlayHandlers["overlay-ready"]({});
     assert.equal(fixture.setClickableCalls, 1);
 });
 
@@ -475,4 +484,115 @@ test("cancels the current stream before a different part starts", async () => {
     await fixture.sidebarHandlers["select-part"]({ index: 1 });
 
     assert.equal(fixture.overlayMessages.filter((message) => message.name === "clear").length, clearCount + 1);
+});
+
+test("loads a direct ep link from a season section instead of the first main episode", async () => {
+    let requestedOid = null;
+    const fixture = loadMainFixture({
+        httpGet(url, request) {
+            if (url.includes("/pgc/view/web/season")) {
+                return {
+                    statusCode: 200,
+                    text: JSON.stringify({ code: 0, result: {
+                        title: "Demo Season",
+                        episodes: [{ id: 1, cid: 101, title: "1", long_title: "Main" }],
+                        section: [{ episodes: [
+                            { id: 99, cid: 999, title: "SP", long_title: "Special" }
+                        ] }]
+                    } })
+                };
+            }
+            if (url.includes("/x/v1/dm/list.so")) {
+                requestedOid = request.params.oid;
+                return { statusCode: 200, text: "<i></i>" };
+            }
+            return undefined;
+        }
+    });
+
+    await fixture.sidebarHandlers["load-source"]({
+        text: "https://www.bilibili.com/bangumi/play/ep99"
+    });
+
+    assert.equal(requestedOid, "999");
+    const videos = fixture.sidebarMessages.filter((message) => message.name === "video");
+    assert.equal(videos.at(-1).data.current, 1);
+});
+
+test("rejects a direct ep link when the requested episode is absent", async () => {
+    let danmakuRequests = 0;
+    const fixture = loadMainFixture({
+        httpGet(url) {
+            if (url.includes("/pgc/view/web/season")) {
+                return {
+                    statusCode: 200,
+                    text: JSON.stringify({ code: 0, result: {
+                        title: "Demo Season",
+                        episodes: [{ id: 1, cid: 101, title: "1", long_title: "Main" }]
+                    } })
+                };
+            }
+            if (url.includes("/x/v1/dm/list.so")) {
+                danmakuRequests += 1;
+            }
+            return undefined;
+        }
+    });
+
+    await fixture.sidebarHandlers["load-source"]({
+        text: "https://www.bilibili.com/bangumi/play/ep99"
+    });
+
+    assert.equal(danmakuRequests, 0);
+    const errors = fixture.sidebarMessages.filter((message) => message.name === "error");
+    assert.match(errors.at(-1).data.message, /目标分集/);
+});
+
+test("resolves an md link through its season before loading danmaku", async () => {
+    let requestedSeasonId = null;
+    let requestedOid = null;
+    const fixture = loadMainFixture({
+        httpGet(url, request) {
+            if (url.includes("/pgc/review/user")) {
+                return {
+                    statusCode: 200,
+                    text: JSON.stringify({ code: 0, result: { media: { season_id: 7 } } })
+                };
+            }
+            if (url.includes("/pgc/view/web/season")) {
+                requestedSeasonId = request.params.season_id;
+                return {
+                    statusCode: 200,
+                    text: JSON.stringify({ code: 0, result: {
+                        title: "Resolved Season",
+                        episodes: [{ id: 70, cid: 700, title: "1", long_title: "Pilot" }]
+                    } })
+                };
+            }
+            if (url.includes("/x/v1/dm/list.so")) {
+                requestedOid = request.params.oid;
+                return { statusCode: 200, text: "<i></i>" };
+            }
+            return undefined;
+        }
+    });
+
+    await fixture.sidebarHandlers["load-source"]({
+        text: "https://www.bilibili.com/bangumi/media/md123"
+    });
+
+    assert.equal(requestedSeasonId, "7");
+    assert.equal(requestedOid, "700");
+});
+
+test("persists a settings patch and returns the merged settings to the sidebar", () => {
+    const fixture = loadMainFixture({ settings: { opacity: 80 } });
+
+    fixture.sidebarHandlers["update-settings"]({ patch: { fontSize: 32 } });
+
+    assert.equal(fixture.savedSettings.opacity, 80);
+    assert.equal(fixture.savedSettings.fontSize, 32);
+    assert.equal(fixture.preferenceSyncCalls, 1);
+    const settings = fixture.sidebarMessages.filter((message) => message.name === "settings");
+    assert.equal(settings.at(-1).data.settings.fontSize, 32);
 });

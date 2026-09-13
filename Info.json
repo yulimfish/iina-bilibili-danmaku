@@ -1,7 +1,7 @@
 {
     "name": "Bili Danmaku",
     "identifier": "cn.waterflames.iina-bilibili-danmaku",
-    "version": "0.1.4",
+    "version": "0.1.5",
     "description": "Map Bilibili danmaku to local videos in IINA",
     "author": {
         "name": "Yulimfish",
@@ -11,11 +11,10 @@
     "entry": "main.js",
     "globalEntry": "global.js",
     "ghRepo": "Yulimfish/iina-bilibili-danmaku",
-    "ghVersion": 5,
+    "ghVersion": 6,
     "permissions": [
         "show-osd",
         "video-overlay",
-        "file-system",
         "network-request"
     ],
     "allowedDomains": [
