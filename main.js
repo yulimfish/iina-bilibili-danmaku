@@ -132,10 +132,14 @@ let danmakuActive = false;
 let streamLoading = false;
 let loadToken = 0; // guards against overlapping loadSource calls
 let pendingSearch = null;
-let latestPlaybackTime = null;
-let lastSentPlaybackTime = null;
-let lastTimeSentAt = 0;
-let playbackPaused = false;
+let playbackState = {
+    time: null,
+    paused: false,
+    rate: 1,
+    seeking: false,
+    revision: 0
+};
+let lastPlaybackStateSentAt = 0;
 const XML_CHUNK_SIZE = 128 * 1024;
 const TIME_UPDATE_INTERVAL = 33;
 
@@ -186,6 +190,9 @@ function applySettings(patch) {
     if (pendingStream) {
         pendingStream.settings = overlaySettings();
     }
+    if ("offset" in patch) {
+        playbackState.revision += 1;
+    }
     if (overlayLoaded) {
         if ("enabled" in patch) {
             if (settings.enabled) {
@@ -203,8 +210,8 @@ function applySettings(patch) {
         if ("speed" in patch || "fontSize" in patch) {
             overlay.postMessage("style", { speed: settings.speed, fontSize: settings.fontSize });
         }
-        if ("offset" in patch && latestPlaybackTime !== null) {
-            syncPlaybackTime(latestPlaybackTime, true);
+        if ("offset" in patch) {
+            sendPlaybackState(true);
         }
     }
     sidebar.postMessage("settings", { settings: settings });
@@ -523,7 +530,7 @@ function cancelOverlayStream() {
     acknowledgeStreamChunk = null;
     pendingStream = null;
     currentStreamId = 0;
-    lastSentPlaybackTime = null;
+    lastPlaybackStateSentAt = 0;
     streamLoading = false;
 }
 
@@ -550,14 +557,12 @@ function startOverlayStream(payload) {
         overlay.show();
     }
     overlay.setOpacity(settings.opacity / 100);
+    readPlaybackState();
     overlay.postMessage("stream-start", {
         streamId: payload.streamId,
         title: payload.title,
         settings: payload.settings,
-        paused: playbackPaused,
-        initialTime: latestPlaybackTime === null
-            ? 0
-            : latestPlaybackTime + settings.offset
+        playbackState: playbackStatePayload()
     });
 
     function pump() {
@@ -638,8 +643,8 @@ event.on("iina.plugin-overlay-loaded", () => {
                 const stream = pendingStream;
                 pendingStream = null;
                 startOverlayStream(stream);
-            } else if (danmakuActive && latestPlaybackTime !== null) {
-                syncPlaybackTime(latestPlaybackTime, true);
+            } else if (danmakuActive && playbackState.time !== null) {
+                sendPlaybackState(true);
             }
         });
         overlay.onMessage("stream-chunk-consumed", (data) => {
@@ -701,39 +706,80 @@ event.on("iina.plugin-overlay-loaded", () => {
     overlay.postMessage("ping", {});
 });
 
-// Playback sync: position (+offset), pause, window resize, file end.
-function syncPlaybackTime(time, force) {
-    if (time === null || time === undefined || time === "") {
-        return;
-    }
-    const nextTime = Number(time);
-    if (!Number.isFinite(nextTime)) {
-        return;
-    }
-    latestPlaybackTime = nextTime;
+// Playback sync: a revision denotes an explicit timeline discontinuity, so the
+// overlay never needs to infer seeks from a time delta.
+function readPlaybackState() {
+    const position = Number(core.status.position);
+    const rate = Number(core.status.speed);
+    playbackState.time = Number.isFinite(position) ? position : playbackState.time;
+    playbackState.paused = Boolean(core.status.paused);
+    playbackState.rate = Number.isFinite(rate) && rate > 0 ? rate : 1;
+}
+
+function playbackStatePayload() {
+    return {
+        time: (playbackState.time === null ? 0 : playbackState.time) + settings.offset,
+        paused: playbackState.paused,
+        rate: playbackState.rate,
+        seeking: playbackState.seeking,
+        revision: playbackState.revision
+    };
+}
+
+function sendPlaybackState(force) {
     if (!overlayLoaded || currentStreamId === 0 || !streamLoading) {
         return;
     }
     const now = Date.now();
-    const jump = lastSentPlaybackTime === null ||
-        nextTime < lastSentPlaybackTime - 0.25 ||
-        Math.abs(nextTime - lastSentPlaybackTime) > 1;
-    if (!force && !jump && now - lastTimeSentAt < TIME_UPDATE_INTERVAL) {
+    if (!force && now - lastPlaybackStateSentAt < TIME_UPDATE_INTERVAL) {
         return;
     }
-    lastSentPlaybackTime = nextTime;
-    lastTimeSentAt = now;
-    overlay.postMessage("time", { time: nextTime + settings.offset });
+    lastPlaybackStateSentAt = now;
+    overlay.postMessage("playback-state", playbackStatePayload());
 }
 
-event.on("mpv.time-pos.changed", (t) => syncPlaybackTime(t, false));
-
-event.on("mpv.pause.changed", (paused) => {
-    playbackPaused = Boolean(paused);
-    if (overlayLoaded && streamLoading) {
-        overlay.postMessage("pause", { paused: playbackPaused });
+function updatePlaybackTime(time) {
+    const nextTime = Number(time);
+    if (!Number.isFinite(nextTime)) {
+        return;
     }
-});
+    playbackState.time = nextTime;
+    if (!playbackState.seeking) {
+        sendPlaybackState(false);
+    }
+}
+
+function updatePlaybackPause(paused) {
+    playbackState.paused = Boolean(paused);
+    sendPlaybackState(true);
+}
+
+function updatePlaybackRate(rate) {
+    const nextRate = Number(rate);
+    playbackState.rate = Number.isFinite(nextRate) && nextRate > 0 ? nextRate : 1;
+    sendPlaybackState(true);
+}
+
+function updateSeekingState(seeking) {
+    if (Boolean(seeking)) {
+        playbackState.seeking = true;
+        sendPlaybackState(true);
+        return;
+    }
+    const position = Number(mpv.getNumber("time-pos"));
+    if (Number.isFinite(position)) {
+        playbackState.time = position;
+    }
+    playbackState.seeking = false;
+    playbackState.revision += 1;
+    lastPlaybackStateSentAt = 0;
+    sendPlaybackState(true);
+}
+
+event.on("mpv.time-pos.changed", updatePlaybackTime);
+event.on("mpv.pause.changed", updatePlaybackPause);
+event.on("mpv.speed.changed", updatePlaybackRate);
+event.on("mpv.seeking.changed", updateSeekingState);
 
 event.on("mpv.window-scale.changed", () => {
     if (danmakuActive && overlayLoaded) {
@@ -743,7 +789,7 @@ event.on("mpv.window-scale.changed", () => {
 
 event.on("mpv.end-file", () => {
     invalidateCurrentLoad();
-    latestPlaybackTime = null;
+    playbackState.time = null;
 });
 
 console.log(TAG + " main entry loaded");

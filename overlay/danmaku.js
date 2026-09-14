@@ -23,6 +23,9 @@ let currentTitle = "";
 let currentTime = 0;
 let hasTime = false;
 let paused = false;
+let seeking = false;
+let playbackRate = 1;
+let playbackRevision = null;
 let streamAvailable = false;
 let progressReportedAt = 0;
 let pendingComments = [];
@@ -47,6 +50,12 @@ function ensureCM() {
     // Drop advanced / code / BAS comments (mode 7/8/9).
     cm.filter.allowUnknownTypes = false;
     cm.options.limit = MAX_ACTIVE_COMMENTS;
+    const onTimerEvent = cm.onTimerEvent;
+    if (typeof onTimerEvent === "function") {
+        cm.onTimerEvent = function (timePassed, manager) {
+            return onTimerEvent.call(this, timePassed * playbackRate, manager);
+        };
+    }
     applyFilter();
     resize();
 }
@@ -152,8 +161,79 @@ function rebuildPendingComments(time) {
     }
 }
 
+function rebuildAtTime(time) {
+    currentTime = time;
+    hasTime = true;
+    if (!cm) {
+        return;
+    }
+    cm.clear();
+    rebuildPendingComments(time);
+    if (!paused && !seeking) {
+        flushDueComments(time);
+    }
+}
+
+function applyPlaybackRate(rate) {
+    playbackRate = rate;
+    if (!cm) {
+        return;
+    }
+    cm.runline.forEach((comment) => {
+        if (!comment.dom || typeof comment.dom.getAnimations !== "function") {
+            return;
+        }
+        comment.dom.getAnimations().forEach((animation) => {
+            animation.playbackRate = rate;
+        });
+    });
+}
+
+function applyPlaybackState(data) {
+    const time = Number(data && data.time);
+    const rate = Number(data && data.rate);
+    const revision = Number(data && data.revision);
+    if (!Number.isFinite(time) || !Number.isFinite(rate) || rate <= 0 ||
+        !Number.isInteger(revision) || revision < 0 ||
+        (playbackRevision !== null && revision < playbackRevision)) {
+        return;
+    }
+    const hadPlaybackState = playbackRevision !== null;
+    const wasBlocked = paused || seeking;
+    const revisionChanged = hadPlaybackState && revision !== playbackRevision;
+    const missedSeekingEvent = !revisionChanged && hasTime &&
+        (time < currentTime - 0.25 || Math.abs(time - currentTime) > 5.5);
+    paused = Boolean(data.paused);
+    seeking = Boolean(data.seeking);
+    playbackRevision = revision;
+    applyPlaybackRate(rate);
+    if (!cm) {
+        return;
+    }
+    if (paused || seeking) {
+        if (revisionChanged || missedSeekingEvent) {
+            rebuildAtTime(time);
+        } else {
+            currentTime = time;
+            hasTime = true;
+        }
+        cm.stop();
+        return;
+    }
+    if (!hadPlaybackState || wasBlocked) {
+        cm.start();
+    }
+    if (revisionChanged || missedSeekingEvent) {
+        rebuildAtTime(time);
+    } else {
+        currentTime = time;
+        hasTime = true;
+        flushDueComments(time);
+    }
+}
+
 function flushDueComments(time) {
-    if (!cm || paused || !Number.isFinite(time)) {
+    if (!cm || paused || seeking || !Number.isFinite(time)) {
         return;
     }
     const dueTime = time * 1000;
@@ -175,6 +255,13 @@ function flushDueComments(time) {
         }
         if (due.length > 0) {
             cm.send(due);
+            applyPlaybackRate(playbackRate);
+            const applyRateAfterAnimationsExist = () => applyPlaybackRate(playbackRate);
+            if (typeof window.requestAnimationFrame === "function") {
+                window.requestAnimationFrame(applyRateAfterAnimationsExist);
+            } else {
+                setTimeout(applyRateAfterAnimationsExist, 0);
+            }
         }
     } catch (error) {
         handleParserError(activeStreamId, String((error && error.message) || error));
@@ -236,7 +323,7 @@ function appendComments(streamId, comments, stats) {
             accepted: stats && stats.accepted
         });
     }
-    if (hasTime && !paused) {
+    if (hasTime && !paused && !seeking) {
         flushDueComments(currentTime);
     }
 }
@@ -267,6 +354,8 @@ function handleParserError(streamId, message) {
     streamAvailable = false;
     currentTime = 0;
     hasTime = false;
+    seeking = false;
+    playbackRevision = null;
     iina.postMessage("stream-state", {
         streamId: failedStreamId,
         phase: "error",
@@ -470,21 +559,21 @@ iina.onMessage("stream-start", (data) => {
     ensureCM();
     activeStreamId = data.streamId;
     currentTitle = data.title || "";
-    if (typeof data.paused === "boolean") {
-        paused = data.paused;
-    }
+    paused = false;
+    seeking = false;
+    playbackRate = 1;
+    playbackRevision = null;
     streamAvailable = false;
     progressReportedAt = 0;
     updateSettings(data.settings);
-    const initialTime = Number(data.initialTime);
-    currentTime = Number.isFinite(initialTime) ? initialTime : 0;
-    hasTime = Number.isFinite(initialTime);
     resetManager();
-    if (paused) {
-        cm.stop();
-    } else {
-        cm.start();
-    }
+    applyPlaybackState(data.playbackState || {
+        time: Number(data.initialTime) || 0,
+        paused: Boolean(data.paused),
+        rate: 1,
+        seeking: false,
+        revision: 0
+    });
     startParser(activeStreamId);
 });
 
@@ -550,41 +639,7 @@ iina.onMessage("style", (data) => {
     }
 });
 
-iina.onMessage("time", (data) => {
-    const nextTime = Number(data && data.time);
-    if (!Number.isFinite(nextTime)) {
-        return;
-    }
-    const jumped = hasTime && (nextTime < currentTime - 0.25 ||
-        Math.abs(nextTime - currentTime) > 5.5);
-    currentTime = nextTime;
-    hasTime = true;
-    if (!cm) {
-        return;
-    }
-    if (jumped) {
-        cm.clear();
-        rebuildPendingComments(nextTime);
-    }
-    if (!paused) {
-        flushDueComments(nextTime);
-    }
-});
-
-iina.onMessage("pause", (data) => {
-    paused = Boolean(data && data.paused);
-    if (!cm) {
-        return;
-    }
-    if (paused) {
-        cm.stop();
-    } else {
-        cm.start();
-        if (hasTime) {
-            flushDueComments(currentTime);
-        }
-    }
-});
+iina.onMessage("playback-state", applyPlaybackState);
 
 iina.onMessage("resize", resize);
 
@@ -595,6 +650,8 @@ iina.onMessage("clear", () => {
     streamAvailable = false;
     currentTime = 0;
     hasTime = false;
+    seeking = false;
+    playbackRevision = null;
     resetManager();
 });
 
@@ -602,7 +659,7 @@ document.addEventListener("visibilitychange", () => {
     if (cm && cm.setHidden) {
         cm.setHidden(document.hidden);
     }
-    if (!document.hidden && hasTime && !paused) {
+    if (!document.hidden && hasTime && !paused && !seeking) {
         flushDueComments(currentTime);
     }
 });

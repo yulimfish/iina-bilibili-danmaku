@@ -9,12 +9,27 @@ function wait(milliseconds = 0) {
     return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+function playbackState(time, patch) {
+    return Object.assign({
+        time,
+        paused: false,
+        rate: 1,
+        seeking: false,
+        revision: 0
+    }, patch);
+}
+
 function loadOverlay(options = {}) {
     const outgoing = [];
     const handlers = {};
     const workers = [];
     let manager = null;
     let providerCreated = 0;
+    const animationFrames = [];
+    const requestAnimationFrame = (callback) => {
+        animationFrames.push(callback);
+        return animationFrames.length;
+    };
 
     class FakeCommentManager {
         constructor() {
@@ -29,6 +44,8 @@ function loadOverlay(options = {}) {
             this.sendCalls = [];
             this.seekCalls = 0;
             this.clearCalls = 0;
+            this.timerValues = [];
+            this.animations = [];
             manager = this;
         }
 
@@ -38,6 +55,7 @@ function loadOverlay(options = {}) {
         clear() { this.clearCalls += 1; this.runline = []; }
         seek() { this.seekCalls += 1; }
         time() { this.timeCalls += 1; }
+        onTimerEvent(timePassed) { this.timerValues.push(timePassed); }
         setHidden(hidden) { this._accepting = !hidden; this.runline = []; }
         validate(comment) {
             if (options.throwOnValidate) {
@@ -49,6 +67,15 @@ function loadOverlay(options = {}) {
             if (options.throwOnSend) {
                 throw new Error("synthetic renderer failure");
             }
+            comments.forEach((comment) => {
+                const animations = [];
+                comment.dom = { getAnimations() { return animations; } };
+                requestAnimationFrame(() => {
+                    const animation = { playbackRate: 1 };
+                    animations.push(animation);
+                    this.animations.push(animation);
+                });
+            });
             this.sendCalls.push(comments);
             this.runline.push(...comments);
         }
@@ -88,7 +115,12 @@ function loadOverlay(options = {}) {
         setTimeout,
         clearTimeout,
         document,
-        window: { innerWidth: 1920, BiliDanmakuParser: parser, addEventListener() {} },
+        window: {
+            innerWidth: 1920,
+            BiliDanmakuParser: parser,
+            requestAnimationFrame,
+            addEventListener() {}
+        },
         CommentManager: FakeCommentManager,
         Worker: FakeWorker,
         BiliDanmakuParser: null,
@@ -108,6 +140,11 @@ function loadOverlay(options = {}) {
         outgoing,
         workers,
         document,
+        flushAnimationFrames() {
+            while (animationFrames.length > 0) {
+                animationFrames.shift()();
+            }
+        },
         get visibilityHandler() { return visibilityHandler; },
         get manager() { return manager; },
         get providerCreated() { return providerCreated; }
@@ -166,7 +203,7 @@ test("overlay renders due comments progressively from an out-of-order batch", ()
     assert.deepEqual(JSON.parse(JSON.stringify(
         fixture.manager.sendCalls.flatMap((batch) => batch.map((comment) => comment.text))
     )), ["due"]);
-    fixture.send("time", { time: 4 });
+    fixture.send("playback-state", playbackState(4));
     assert.deepEqual(JSON.parse(JSON.stringify(
         fixture.manager.sendCalls.flatMap((batch) => batch.map((comment) => comment.text))
     )), ["due", "future"]);
@@ -197,7 +234,7 @@ test("overlay skips old history when loading at an advanced playback time", () =
     assert.deepEqual(JSON.parse(JSON.stringify(
         fixture.manager.sendCalls.flatMap((batch) => batch.map((comment) => comment.text))
     )), ["recent"]);
-    fixture.send("time", { time: 101 });
+    fixture.send("playback-state", playbackState(101));
     assert.deepEqual(JSON.parse(JSON.stringify(
         fixture.manager.sendCalls.flatMap((batch) => batch.map((comment) => comment.text))
     )), ["recent", "future"]);
@@ -219,7 +256,7 @@ test("overlay falls back to time-sliced parsing when Worker is unavailable", asy
     });
     fixture.send("stream-end", { streamId: 4 });
     await wait(10);
-    fixture.send("time", { time: 5 });
+    fixture.send("playback-state", playbackState(5));
 
     assert.deepEqual(JSON.parse(JSON.stringify(
         fixture.manager.sendCalls.flatMap((batch) => batch.map((comment) => comment.text))
@@ -301,7 +338,7 @@ test("overlay falls back when the worker fails before parsing anything", async (
     });
     fixture.send("stream-end", { streamId: 30 });
     await wait(20);
-    fixture.send("time", { time: 3 });
+    fixture.send("playback-state", playbackState(3));
 
     assert.deepEqual(JSON.parse(JSON.stringify(
         fixture.manager.sendCalls.flatMap((batch) => batch.map((comment) => comment.text))
@@ -370,12 +407,86 @@ test("overlay does not advance CCL while a stream is paused", () => {
         accepted: 1,
         skipped: 0
     });
-    fixture.send("time", { time: 5 });
+    fixture.send("playback-state", playbackState(5, { paused: true }));
 
     assert.equal(fixture.manager.stopCalls > 0, true);
     assert.equal(fixture.manager.sendCalls.length, 0);
-    fixture.send("pause", { paused: false });
+    fixture.send("playback-state", playbackState(5));
     assert.equal(fixture.manager.sendCalls.length, 1);
+});
+
+test("overlay follows playback-state revisions and keeps CCL plus DOM animations in sync", () => {
+    const fixture = loadOverlay();
+    fixture.send("stream-start", {
+        streamId: 50,
+        title: "Playback state",
+        settings: { fontSize: 25, speed: 680, showTop: true, showBottom: true },
+        playbackState: { time: 5, paused: false, rate: 1, seeking: false, revision: 0 }
+    });
+    fixture.workers[0].emit({
+        type: "comments",
+        streamId: 50,
+        comments: [
+            { stime: 1000, mode: 1, size: 18, text: "old" },
+            { stime: 5000, mode: 1, size: 18, text: "visible" },
+            { stime: 7000, mode: 4, size: 18, text: "target" }
+        ],
+        parsed: 3,
+        accepted: 3,
+        skipped: 0
+    });
+    assert.deepEqual(JSON.parse(JSON.stringify(
+        fixture.manager.runline.map((comment) => comment.text)
+    )), ["visible"]);
+
+    const clearBeforeSeeking = fixture.manager.clearCalls;
+    fixture.send("playback-state", {
+        time: 6, paused: false, rate: 2, seeking: true, revision: 0
+    });
+    fixture.send("playback-state", {
+        time: 7, paused: false, rate: 2, seeking: true, revision: 0
+    });
+    assert.equal(fixture.manager.stopCalls > 0, true);
+    assert.equal(fixture.manager.clearCalls, clearBeforeSeeking);
+
+    fixture.send("playback-state", {
+        time: 7, paused: false, rate: 2, seeking: false, revision: 1
+    });
+    fixture.flushAnimationFrames();
+    assert.deepEqual(JSON.parse(JSON.stringify(
+        fixture.manager.runline.map((comment) => comment.text)
+    )), ["target"]);
+    assert.equal(fixture.manager.clearCalls, clearBeforeSeeking + 1);
+    fixture.manager.onTimerEvent(10);
+    assert.equal(fixture.manager.timerValues.at(-1), 20);
+    assert.equal(fixture.manager.animations.at(-1).playbackRate, 2);
+
+    fixture.workers[0].emit({
+        type: "comments",
+        streamId: 50,
+        comments: [
+            { stime: 1000, mode: 1, size: 18, text: "late batch" },
+            { stime: 7000, mode: 5, size: 18, text: "new target" }
+        ],
+        parsed: 5,
+        accepted: 5,
+        skipped: 0
+    });
+    fixture.flushAnimationFrames();
+    assert.deepEqual(JSON.parse(JSON.stringify(
+        fixture.manager.runline.map((comment) => comment.text)
+    )), ["target", "new target"]);
+    assert.equal(fixture.manager.animations.at(-1).playbackRate, 2);
+
+    fixture.send("playback-state", {
+        time: 7, paused: true, rate: 0.5, seeking: false, revision: 1
+    });
+    fixture.send("playback-state", {
+        time: 7, paused: false, rate: 0.5, seeking: false, revision: 1
+    });
+    fixture.manager.onTimerEvent(10);
+    assert.equal(fixture.manager.timerValues.at(-1), 5);
+    assert.equal(fixture.manager.animations.at(-1).playbackRate, 0.5);
 });
 
 test("overlay ignores batches from a superseded stream", () => {
@@ -409,7 +520,7 @@ test("overlay ignores batches from a superseded stream", () => {
     )), ["new"]);
 });
 
-test("overlay clears and seeks on a large backward or forward jump", () => {
+test("overlay clears and seeks when a seeking event is missed", () => {
     const fixture = loadOverlay();
     fixture.send("stream-start", {
         streamId: 8,
@@ -418,9 +529,74 @@ test("overlay clears and seeks on a large backward or forward jump", () => {
         initialTime: 1
     });
     const clearBeforeJump = fixture.manager.clearCalls;
-    fixture.send("time", { time: 8 });
+    fixture.send("playback-state", playbackState(8));
 
     assert.equal(fixture.manager.clearCalls > clearBeforeJump, true);
+});
+
+test("overlay rebuilds during a paused seek before it resumes", () => {
+    const fixture = loadOverlay();
+    fixture.send("stream-start", {
+        streamId: 51,
+        title: "Paused seek",
+        settings: { fontSize: 25, speed: 680, showTop: true, showBottom: true },
+        playbackState: { time: 5, paused: false, rate: 1, seeking: false, revision: 0 }
+    });
+    fixture.workers[0].emit({
+        type: "comments",
+        streamId: 51,
+        comments: [
+            { stime: 5000, mode: 1, size: 18, text: "old visible" },
+            { stime: 10000, mode: 1, size: 18, text: "final target" }
+        ],
+        parsed: 2,
+        accepted: 2,
+        skipped: 0
+    });
+    fixture.send("playback-state", playbackState(5, { paused: true }));
+    const clearBeforeSeek = fixture.manager.clearCalls;
+    fixture.send("playback-state", playbackState(10, { paused: true, revision: 1 }));
+
+    assert.equal(fixture.manager.clearCalls, clearBeforeSeek + 1);
+    assert.deepEqual(JSON.parse(JSON.stringify(
+        fixture.manager.runline.map((comment) => comment.text)
+    )), []);
+
+    fixture.send("playback-state", playbackState(10, { revision: 1 }));
+    assert.deepEqual(JSON.parse(JSON.stringify(
+        fixture.manager.runline.map((comment) => comment.text)
+    )), ["final target"]);
+});
+
+test("overlay ignores stale playback revisions", () => {
+    const fixture = loadOverlay();
+    fixture.send("stream-start", {
+        streamId: 52,
+        title: "Stale revision",
+        settings: { fontSize: 25, speed: 680, showTop: true, showBottom: true },
+        playbackState: { time: 5, paused: false, rate: 1, seeking: false, revision: 0 }
+    });
+    fixture.workers[0].emit({
+        type: "comments",
+        streamId: 52,
+        comments: [
+            { stime: 5000, mode: 1, size: 18, text: "old" },
+            { stime: 7000, mode: 1, size: 18, text: "current" }
+        ],
+        parsed: 2,
+        accepted: 2,
+        skipped: 0
+    });
+    fixture.send("playback-state", playbackState(7, { revision: 1 }));
+    fixture.flushAnimationFrames();
+    const clearAfterRevision = fixture.manager.clearCalls;
+    fixture.send("playback-state", playbackState(5, { paused: true, rate: 0.5 }));
+
+    assert.equal(fixture.manager.clearCalls, clearAfterRevision);
+    assert.deepEqual(JSON.parse(JSON.stringify(
+        fixture.manager.runline.map((comment) => comment.text)
+    )), ["current"]);
+    assert.equal(fixture.manager.animations.at(-1).playbackRate, 1);
 });
 
 test("overlay reports an empty stream without marking it available", () => {
@@ -466,7 +642,7 @@ test("overlay clears visible and queued comments after a parser error", () => {
     fixture.workers[0].emit({
         type: "error", streamId: 13, message: "bad XML"
     });
-    fixture.send("time", { time: 20 });
+    fixture.send("playback-state", playbackState(20));
 
     assert.equal(fixture.manager.clearCalls > 0, true);
     assert.equal(fixture.manager.timeline.length, 0);
@@ -520,8 +696,8 @@ test("overlay replays received comments after a backward seek", () => {
         accepted: 2,
         skipped: 0
     });
-    fixture.send("time", { time: 5 });
-    fixture.send("time", { time: 0 });
+    fixture.send("playback-state", playbackState(5));
+    fixture.send("playback-state", playbackState(0, { revision: 1 }));
 
     assert.deepEqual(JSON.parse(JSON.stringify(
         fixture.manager.sendCalls.flatMap((batch) => batch.map((comment) => comment.text))

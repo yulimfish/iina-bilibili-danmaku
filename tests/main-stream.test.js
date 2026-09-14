@@ -34,6 +34,9 @@ function loadMainFixture(options = {}) {
     let setClickableCalls = 0;
     let savedSettings = null;
     let preferenceSyncCalls = 0;
+    let mpvPosition = options.mpvPosition === undefined
+        ? (options.position === undefined ? 0 : options.position)
+        : options.mpvPosition;
     const defaultXml = '<i><d p="1,1,25,1,1,0,h,1">' +
         "x".repeat(128 * 1024 + 20) + "</d></i>";
     const xmls = options.xmls || [defaultXml];
@@ -111,16 +114,30 @@ function loadMainFixture(options = {}) {
             throw new Error("unexpected URL: " + url);
         }
     };
+    const core = {
+        window: { loaded: options.windowLoadedInitially !== false },
+        status: {
+            idle: false,
+            position: options.position === undefined ? 0 : options.position,
+            paused: options.paused === true,
+            speed: options.speed === undefined ? 1 : options.speed
+        }
+    };
+    const mpv = {
+        getNumber(name) {
+            return name === "time-pos" ? mpvPosition : NaN;
+        },
+        getFlag(name) {
+            return name === "pause" ? Boolean(core.status.paused) : false;
+        }
+    };
     const context = {
         console,
         Date: { now: () => clock.now },
         setTimeout,
         clearTimeout,
         iina: {
-            core: {
-                window: { loaded: options.windowLoadedInitially !== false },
-                status: { idle: false }
-            },
+            core,
             console,
             menu: {
                 item() { return { addSubMenuItem() {} }; },
@@ -131,7 +148,7 @@ function loadMainFixture(options = {}) {
             event: {
                 on(name, handler) { eventHandlers[name] = handler; }
             },
-            mpv: {},
+            mpv,
             http,
             preferences: {
                 get(key) { return key === "settings" ? options.settings || null : null; },
@@ -152,6 +169,8 @@ function loadMainFixture(options = {}) {
     return {
         eventHandlers, sidebarHandlers, overlayHandlers, overlayMessages, sidebarMessages,
         clock, xmls, core: context.iina.core,
+        get mpvPosition() { return mpvPosition; },
+        set mpvPosition(value) { mpvPosition = value; },
         get setClickableCalls() { return setClickableCalls; },
         get savedSettings() { return savedSettings; },
         get preferenceSyncCalls() { return preferenceSyncCalls; }
@@ -179,10 +198,12 @@ test("main streams bounded chunks and throttles ordinary time updates", async ()
     fixture.eventHandlers["mpv.time-pos.changed"](10);
     fixture.eventHandlers["mpv.time-pos.changed"](10.01);
     fixture.eventHandlers["mpv.time-pos.changed"](10.02);
-    assert.equal(fixture.overlayMessages.filter((message) => message.name === "time").length, 1);
+    assert.equal(fixture.overlayMessages.filter((message) =>
+        message.name === "playback-state").length, 1);
     fixture.clock.now = 1033;
     fixture.eventHandlers["mpv.time-pos.changed"](10.05);
-    assert.equal(fixture.overlayMessages.filter((message) => message.name === "time").length, 2);
+    assert.equal(fixture.overlayMessages.filter((message) =>
+        message.name === "playback-state").length, 2);
 });
 
 test("main waits for each overlay chunk acknowledgement before sending the next", async () => {
@@ -235,18 +256,17 @@ test("touches the overlay view only after it reports ready", async () => {
     assert.equal(fixture.setClickableCalls, 1);
 });
 
-test("includes the playback offset in the first stream timestamp", async () => {
-    const fixture = loadMainFixture({ settings: { offset: 2 } });
-    fixture.eventHandlers["mpv.time-pos.changed"](10);
+test("includes the playback offset in the initial playback state", async () => {
+    const fixture = loadMainFixture({ settings: { offset: 2 }, position: 10 });
     await fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
     await wait(5);
 
     const stream = fixture.overlayMessages.find((message) => message.name === "stream-start");
-    assert.equal(stream.data.initialTime, 12);
+    assert.equal(stream.data.playbackState.time, 12);
 });
 
 test("keeps pause state and pending settings when the overlay is not ready", async () => {
-    const fixture = loadMainFixture();
+    const fixture = loadMainFixture({ paused: true });
     fixture.eventHandlers["mpv.pause.changed"](true);
     const load = fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
     fixture.sidebarHandlers["update-settings"]({ patch: { fontSize: 32 } });
@@ -254,8 +274,19 @@ test("keeps pause state and pending settings when the overlay is not ready", asy
     await wait(5);
 
     const stream = fixture.overlayMessages.find((message) => message.name === "stream-start");
-    assert.equal(stream.data.paused, true);
+    assert.equal(stream.data.playbackState.paused, true);
     assert.equal(stream.data.settings.fontSize, 32);
+});
+
+test("increments the playback revision when an offset changes before rendering starts", async () => {
+    const fixture = loadMainFixture({ position: 10 });
+    fixture.sidebarHandlers["update-settings"]({ patch: { offset: 2 } });
+    await fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
+    await wait(5);
+
+    const stream = fixture.overlayMessages.find((message) => message.name === "stream-start");
+    assert.equal(stream.data.playbackState.time, 12);
+    assert.equal(stream.data.playbackState.revision, 1);
 });
 
 test("forwards time and offset changes while a stream is still parsing", async () => {
@@ -265,11 +296,55 @@ test("forwards time and offset changes while a stream is still parsing", async (
     const stream = fixture.overlayMessages.find((message) => message.name === "stream-start");
     fixture.clock.now = 1000;
     fixture.eventHandlers["mpv.time-pos.changed"](3);
-    assert.equal(fixture.overlayMessages.filter((message) => message.name === "time").length, 1);
+    assert.equal(fixture.overlayMessages.filter((message) =>
+        message.name === "playback-state").length, 1);
     fixture.sidebarHandlers["update-settings"]({ patch: { offset: 2 } });
-    const times = fixture.overlayMessages.filter((message) => message.name === "time");
-    assert.equal(times[times.length - 1].data.time, 5);
+    const states = fixture.overlayMessages.filter((message) =>
+        message.name === "playback-state");
+    assert.equal(states[states.length - 1].data.time, 5);
     assert.equal(stream.data.streamId > 0, true);
+});
+
+test("publishes an active playback snapshot and immediate discontinuity states", async () => {
+    const fixture = loadMainFixture({
+        settings: { offset: 2 }, position: 10, paused: true, speed: 1.5
+    });
+    await fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
+    await wait(5);
+
+    const stream = fixture.overlayMessages.find((message) => message.name === "stream-start");
+    assert.deepEqual(JSON.parse(JSON.stringify(stream.data.playbackState)), {
+        time: 12, paused: true, rate: 1.5, seeking: false, revision: 0
+    });
+
+    fixture.clock.now = 1000;
+    fixture.eventHandlers["mpv.time-pos.changed"](10);
+    fixture.eventHandlers["mpv.time-pos.changed"](10.01);
+    fixture.core.status.speed = 2;
+    fixture.eventHandlers["mpv.speed.changed"](2);
+    fixture.core.status.paused = false;
+    fixture.eventHandlers["mpv.pause.changed"](false);
+    fixture.eventHandlers["mpv.seeking.changed"](true);
+    fixture.mpvPosition = 20;
+    fixture.core.status.position = 20;
+    fixture.eventHandlers["mpv.seeking.changed"](false);
+    fixture.sidebarHandlers["update-settings"]({ patch: { offset: 3 } });
+
+    const states = fixture.overlayMessages.filter((message) =>
+        message.name === "playback-state").map((message) => message.data);
+    assert.equal(states.length, 6);
+    assert.deepEqual(JSON.parse(JSON.stringify(states.at(-4))), {
+        time: 12.01, paused: false, rate: 2, seeking: false, revision: 0
+    });
+    assert.deepEqual(JSON.parse(JSON.stringify(states.at(-3))), {
+        time: 12.01, paused: false, rate: 2, seeking: true, revision: 0
+    });
+    assert.deepEqual(JSON.parse(JSON.stringify(states.at(-2))), {
+        time: 22, paused: false, rate: 2, seeking: false, revision: 1
+    });
+    assert.deepEqual(JSON.parse(JSON.stringify(states.at(-1))), {
+        time: 23, paused: false, rate: 2, seeking: false, revision: 2
+    });
 });
 
 test("forwards progressive parser phases to the sidebar status", async () => {
