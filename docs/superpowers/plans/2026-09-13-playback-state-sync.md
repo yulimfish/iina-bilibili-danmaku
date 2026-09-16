@@ -26,7 +26,7 @@
 
 ---
 
-## 当前交接状态（2026-09-14）
+## 当前交接状态（2026-09-16）
 
 ### 全局状态
 
@@ -34,8 +34,8 @@
 - 自动化验证已通过：`node --test tests/*.test.js`，共 `63/63` 通过。
 - 静态验证已通过：四个运行时 JavaScript 文件均通过 `node --check`，`git diff --check` 通过。
 - 独立 `goal-verify` 终审为 `PASS`，无 BLOCKER 或 MAJOR 问题。
-- IINA 1.4.4 已确认可加载插件并显示 Bili Danmaku 侧栏；完整实机播放矩阵尚未完成。
-- 本次实现不新增依赖、不修改 `overlay/vendor/*`；本机已安装插件已恢复为原 `0.1.4`。
+- IINA 1.4.4 已确认可加载插件并显示 Bili Danmaku 侧栏；`0.5x / 1x / 2x` × `播放 / 暂停 / 前跳 / 后跳 / 拖动后释放` 实机矩阵已通过。
+- 本次实现不新增依赖、不修改 `overlay/vendor/*`；实机验证期间本机安装的是当前源码构建的 `0.1.5` 测试包。
 
 ### 子任务状态
 
@@ -43,13 +43,11 @@
 - Task 2：已完成。seek 开始冻结，seek 结束读取最终 `time-pos` 并递增 revision；offset 变化也递增 revision。
 - Task 3：已完成。显式 revision、暂停中 seek 和 seeking 事件漏发时的时间跳变均触发清屏重建；过期 revision 被忽略。
 - Task 4：已完成。播放器 `rate` 与 `settings.speed` 解耦；CCL 定时器、在屏 CSS animation 及下一帧新建动画统一跟随 `0.5x/1x/2x`。
-- Task 5：自动化验证与独立审计已完成；IINA 实机矩阵仍保持未完成，不得将该项标记为已验证。
+- Task 5：自动化验证、独立审计与 IINA 1.4.4 实机矩阵均已完成。
 
-### 下一 Agent 入口
+### 验证结论
 
-- 首先运行 `node --test tests/*.test.js`，确认交接基线仍为 `63/63`。
-- 仅需在 IINA 1.4.4 完成 `0.5x / 1x / 2x` × `播放 / 暂停 / 前跳 / 后跳 / 拖动后释放` 实机矩阵，并记录旧弹幕消失、最终位置重建和视频无卡顿结果。
-- 实机验证通过后，才可勾选 Task 5 的最后一个复选框；若环境仍无法稳定操作 IINA，继续保留未勾选并记录阻塞原因。
+- IINA 1.4.4 已完成 `0.5x / 1x / 2x` × `播放 / 暂停 / 前跳 / 后跳 / 拖动后释放` 实机矩阵；旧弹幕会在时间轴不连续后消失，恢复后仅显示最终位置对应弹幕，视频播放无卡顿。
 - 当前工作区另有未跟踪的 `docs/superpowers/.DS_Store`，它与本任务无关，不应纳入提交。
 
 ---
@@ -158,5 +156,5 @@ function rebuildAtTime(time) {
 
 - [x] 运行 `node --test tests/*.test.js`，预期 0 失败。
 - [x] 运行 `node --check main.js && node --check overlay/danmaku.js && node --check overlay/danmaku-parser.js && node --check overlay/parser-worker.js`，预期全部退出码为 0。
-- [ ] 在 IINA 1.4.4 实机完成 `0.5x / 1x / 2x` × `播放 / 暂停 / 前跳 / 后跳 / 拖动后释放` 矩阵；每次确认旧弹幕立即消失、恢复后只出现最终时间对应弹幕、视频播放无卡顿。
+- [x] 在 IINA 1.4.4 实机完成 `0.5x / 1x / 2x` × `播放 / 暂停 / 前跳 / 后跳 / 拖动后释放` 矩阵；每次确认旧弹幕立即消失、恢复后只出现最终时间对应弹幕、视频播放无卡顿。
 - [x] 运行全新 `goal-verify` 只读审计，覆盖需求、逻辑、边界、代码质量、测试有效性和实机结果；BLOCKER 与低成本 MAJOR 修复后重新审计。
