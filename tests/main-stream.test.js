@@ -30,6 +30,7 @@ function loadMainFixture(options = {}) {
     const overlayHandlers = {};
     const overlayMessages = [];
     const sidebarMessages = [];
+    const osdMessages = [];
     const clock = { now: 0 };
     let setClickableCalls = 0;
     let savedSettings = null;
@@ -116,6 +117,7 @@ function loadMainFixture(options = {}) {
     };
     const core = {
         window: { loaded: options.windowLoadedInitially !== false },
+        osd(message) { osdMessages.push(message); },
         status: {
             idle: false,
             position: options.position === undefined ? 0 : options.position,
@@ -167,7 +169,7 @@ function loadMainFixture(options = {}) {
         path.join(__dirname, "..", "main.js"), "utf8"
     ), context);
     return {
-        eventHandlers, sidebarHandlers, overlayHandlers, overlayMessages, sidebarMessages,
+        eventHandlers, sidebarHandlers, overlayHandlers, overlayMessages, sidebarMessages, osdMessages,
         clock, xmls, core: context.iina.core,
         get mpvPosition() { return mpvPosition; },
         set mpvPosition(value) { mpvPosition = value; },
@@ -204,6 +206,18 @@ test("main streams bounded chunks and throttles ordinary time updates", async ()
     fixture.eventHandlers["mpv.time-pos.changed"](10.05);
     assert.equal(fixture.overlayMessages.filter((message) =>
         message.name === "playback-state").length, 2);
+});
+
+test("shows the selected source in OSD after its danmaku loads", async () => {
+    const fixture = loadMainFixture({ pageCount: 2 });
+
+    await fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
+    await fixture.sidebarHandlers["select-part"]({ index: 1 });
+
+    assert.deepEqual(fixture.osdMessages, [
+        "已切换到「Demo 1」第 1 P",
+        "已切换到「Demo 1」第 2 P"
+    ]);
 });
 
 test("main waits for each overlay chunk acknowledgement before sending the next", async () => {

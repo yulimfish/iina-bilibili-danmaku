@@ -306,6 +306,7 @@ async function loadPart(index, token) {
     }
     pushToOverlay(xml);
     pushPartsToSidebar();
+    core.osd("已切换到「" + video.title + "」" + label);
 }
 
 async function loadSource(text) {
