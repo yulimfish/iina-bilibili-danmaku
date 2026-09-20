@@ -40,6 +40,32 @@
   label.opt { display: block; margin: 6px 0; }
   input[type="range"] { width: 100%; }
   .hint { color: #777; margin-top: 10px; }
+  /* stroke: label on its own line, slider + circular chip share the line below */
+  .stroke-ctl { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
+  .stroke-ctl input[type="range"] { flex: 1 1 auto; width: auto; }
+  .color-chip {
+    -webkit-appearance: none; appearance: none;
+    width: 16px; height: 16px; padding: 0; margin: 0; flex: none;
+    border: 2px solid #fff; border-radius: 50%;
+    background: transparent; cursor: pointer;
+  }
+  .color-chip::-webkit-color-swatch-wrapper { padding: 0; }
+  .color-chip::-webkit-color-swatch { border: none; border-radius: 50%; }
+  /* font combo: text input + custom dropdown panel (WKWebView has no datalist) */
+  .combo { position: relative; display: block; }
+  .combo input[type="text"] { padding-right: 20px; }
+  .combo-arrow {
+    position: absolute; right: 7px; top: 50%; transform: translateY(-50%);
+    color: #888; pointer-events: none; font-size: 10px;
+  }
+  .combo-panel {
+    position: absolute; left: 0; right: 0; top: 100%; z-index: 30;
+    max-height: 180px; overflow-y: auto;
+    background: #1c1c1c; border: 1px solid #555; border-radius: 4px;
+    margin-top: 2px; padding: 2px 0;
+  }
+  .font-opt { padding: 4px 8px; cursor: pointer; color: #ddd; white-space: nowrap; }
+  .font-opt:hover { background: #333; }
 </style>
 </head>
 <body>
@@ -70,32 +96,15 @@
   <label class="opt"><input type="checkbox" id="set-bottom" checked> 底部弹幕</label>
   <label class="opt">字号 <span id="val-fontsize">25</span><input type="range" id="set-fontsize" min="18" max="36" value="25"></label>
   <label class="opt">字体
-    <input type="text" id="set-font-family" list="font-family-list" placeholder="输入或选择字体">
+    <span class="combo">
+      <input type="text" id="set-font-family" placeholder="输入或选择字体" autocomplete="off">
+      <span class="combo-arrow">▾</span>
+      <div id="font-family-list" class="combo-panel hidden"></div>
+    </span>
   </label>
-  <datalist id="font-family-list">
-    <option value="system" label="系统默认"></option>
-    <option value="sans" label="无衬线"></option>
-    <option value="serif" label="宋体"></option>
-    <option value="rounded" label="圆体"></option>
-    <option value="mono" label="等宽"></option>
-    <option value="PingFang SC"></option>
-    <option value="Songti SC"></option>
-    <option value="Heiti SC"></option>
-    <option value="Hiragino Sans GB"></option>
-    <option value="Kaiti SC"></option>
-    <option value="Yuanti SC"></option>
-    <option value="Lantinghei SC"></option>
-    <option value="Microsoft YaHei"></option>
-    <option value="SimHei"></option>
-    <option value="Arial"></option>
-    <option value="Helvetica Neue"></option>
-    <option value="Menlo"></option>
-    <option value="Monaco"></option>
-    <option value="Times New Roman"></option>
-    <option value="Georgia"></option>
-    <option value="Courier New"></option>
-  </datalist>
-  <label class="opt">描边 <span id="val-stroke">1px</span><input type="range" id="set-stroke" min="0" max="3" step="0.5" value="1"><input type="color" id="set-stroke-color" value="#000000" style="width:48px; vertical-align:middle; background:transparent; border:none;"></label>
+  <label class="opt">描边 <span id="val-stroke">1px</span>
+    <span class="stroke-ctl"><input type="range" id="set-stroke" min="0" max="3" step="0.5" value="1"><input type="color" id="set-stroke-color" class="color-chip" value="#000000"></span>
+  </label>
   <label class="opt">透明度 <span id="val-opacity">100</span><input type="range" id="set-opacity" min="0" max="100" value="100"></label>
   <label class="opt">速度 <span id="val-speed">680</span><input type="range" id="set-speed" min="200" max="1200" value="680"></label>
   <label class="opt">偏移 <span id="val-offset">0s</span><input type="range" id="set-offset" min="-30" max="30" value="0"></label>
@@ -281,47 +290,134 @@
     refreshValueLabels();
   });
 
-  // font-list: main.js sends installed system fonts; keep presets, replace fallback fonts.
+  // Font combo (custom dropdown; WKWebView does not render datalist).
+  // Performance: option nodes are built once per font-list via a single
+  // DocumentFragment insertion; typing only toggles style.display on existing
+  // nodes and never posts messages (patch fires on change/blur/pick only).
+  const FONT_PRESET_ITEMS = [
+    { value: "system", label: "系统默认" },
+    { value: "sans", label: "无衬线" },
+    { value: "serif", label: "宋体" },
+    { value: "rounded", label: "圆体" },
+    { value: "mono", label: "等宽" }
+  ];
+  const FALLBACK_FONTS = [
+    "PingFang SC", "Songti SC", "Heiti SC", "Hiragino Sans GB",
+    "Kaiti SC", "Yuanti SC", "Lantinghei SC", "Microsoft YaHei",
+    "SimHei", "Arial", "Helvetica Neue", "Menlo", "Monaco",
+    "Times New Roman", "Georgia", "Courier New"
+  ];
+  const FONT_PANEL_CAP = 500;
+  let fontExtras = FALLBACK_FONTS.slice();
+  const fontPanel = document.getElementById("font-family-list");
+  const fontInput = ctl.fontFamily;
+  let fontNodes = []; // { node, hay, value } — rebuilt only on font-list arrival
+
+  function buildFontPanel() {
+    const seen = new Set();
+    const items = [];
+    FONT_PRESET_ITEMS.forEach((p) => {
+      seen.add(p.value);
+      items.push(p);
+    });
+    fontExtras.forEach((name) => {
+      if (typeof name === "string" && name && !seen.has(name)) {
+        seen.add(name);
+        items.push({ value: name, label: name });
+      }
+    });
+    const frag = document.createDocumentFragment();
+    fontNodes = [];
+    items.slice(0, FONT_PANEL_CAP).forEach((item) => {
+      const div = document.createElement("div");
+      div.className = "font-opt";
+      div.textContent = item.label;
+      div.dataset.value = item.value;
+      div.onmousedown = () => pickFont(item.value);
+      frag.appendChild(div);
+      fontNodes.push({ node: div, hay: (item.label + " " + item.value).toLowerCase(), value: item.value });
+    });
+    fontPanel.textContent = "";
+    fontPanel.appendChild(frag);
+    filterFontPanel();
+  }
+
+  function filterFontPanel() {
+    const q = fontInput.value.trim().toLowerCase();
+    for (let i = 0; i < fontNodes.length; i++) {
+      const hit = !q || fontNodes[i].hay.indexOf(q) >= 0;
+      fontNodes[i].node.style.display = hit ? "" : "none";
+    }
+  }
+
+  function openFontPanel() {
+    fontPanel.classList.remove("hidden");
+    // Opening must show the FULL list: the input already holds the committed
+    // value (e.g. "system"), filtering by it on open would hide every other
+    // font. Filtering happens only on explicit typing (input events).
+    for (let i = 0; i < fontNodes.length; i++) {
+        fontNodes[i].node.style.display = "";
+    }
+  }
+
+  function closeFontPanel() {
+    fontPanel.classList.add("hidden");
+  }
+
+  function pickFont(value) {
+    fontInput.value = value;
+    closeFontPanel();
+    if (fontInput.onchange) {
+      fontInput.onchange();
+    }
+  }
+
+  fontInput.addEventListener("focus", () => {
+    openFontPanel();
+    if (typeof fontInput.select === "function") {
+      fontInput.select();
+    }
+  });
+  fontInput.addEventListener("input", () => {
+    if (fontPanel.classList.contains("hidden")) {
+      fontPanel.classList.remove("hidden");
+    }
+    filterFontPanel();
+  });
+  fontInput.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      closeFontPanel();
+    }
+  });
+  document.addEventListener("mousedown", (e) => {
+    if (fontPanel.classList.contains("hidden")) {
+      return;
+    }
+    const t = e.target;
+    if (t !== fontInput && !fontPanel.contains(t)) {
+      closeFontPanel();
+    }
+  });
+
+  // font-list: main.js sends installed system fonts; presets kept, extras replaced.
   iina.onMessage("font-list", (data) => {
     const fonts = data && data.fonts;
     if (!Array.isArray(fonts) || fonts.length === 0) {
       return;
     }
-    const list = document.getElementById("font-family-list");
-    if (!list) {
-      return;
-    }
-    const presets = [
-      { value: "system", label: "系统默认" },
-      { value: "sans", label: "无衬线" },
-      { value: "serif", label: "宋体" },
-      { value: "rounded", label: "圆体" },
-      { value: "mono", label: "等宽" }
-    ];
-    const seen = new Set(presets.map((p) => p.value));
+    const seen = new Set(FONT_PRESET_ITEMS.map((p) => p.value));
     const extras = [];
     for (const name of fonts) {
-      if (typeof name !== "string" || !name || seen.has(name)) {
-        continue;
+      if (typeof name === "string" && name && !seen.has(name)) {
+        seen.add(name);
+        extras.push(name);
       }
-      seen.add(name);
-      extras.push(name);
     }
-    while (list.firstChild) {
-      list.removeChild(list.firstChild);
-    }
-    const addOption = (value, label) => {
-      const opt = document.createElement("option");
-      opt.value = value;
-      if (label) {
-        opt.label = label;
-      }
-      list.appendChild(opt);
-    };
-    presets.forEach((p) => addOption(p.value, p.label));
-    extras.slice(0, 500 - presets.length).forEach((name) => addOption(name));
+    fontExtras = extras.slice(0, FONT_PANEL_CAP - FONT_PRESET_ITEMS.length);
+    buildFontPanel();
   });
 
+  buildFontPanel();
   iina.postMessage("sidebar-ready", {});
 </script>
 </body>
