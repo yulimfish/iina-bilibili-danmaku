@@ -8,10 +8,9 @@
   html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
   #stage { position: fixed; inset: 0; }
   #commentCanvas { position: absolute; inset: 0; }
-  .abp .container .cmt,
-  .abp .container .cmt.reverse-shadow,
-  .abp .container .cmt.no-shadow {
+  .abp .container .cmt {
     -webkit-text-stroke-width: var(--danmaku-stroke-width, 1px);
+    -webkit-text-stroke-color: var(--danmaku-stroke-color, #000);
   }
 </style>
 <script src="vendor/CommentCoreLibrary.js"></script>

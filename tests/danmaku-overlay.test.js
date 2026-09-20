@@ -74,6 +74,19 @@ function loadOverlay(options = {}) {
                 const animations = [];
                 comment.dom = { style: {}, getAnimations() { return animations; } };
                 comment.fontWrites = 0;
+                // Mirror CCL CoreComment: the color setter writes dom.style.color
+                // from XML data and must stay untouched by font/stroke settings.
+                Object.defineProperty(comment, "color", {
+                    get() { return this._color; },
+                    set(value) {
+                        this._color = value;
+                        this.dom.style.color =
+                            "#" + (Number(value) >>> 0).toString(16).padStart(6, "0");
+                    }
+                });
+                if (data.color !== undefined) {
+                    comment.color = data.color;
+                }
                 Object.defineProperty(comment, "font", {
                     get() { return this.dom.style.fontFamily; },
                     set(value) {
@@ -240,15 +253,46 @@ test("live fonts update visible, queued and replayed history without resetting p
     assert.equal(manager.runline[0].color, 0x00ff00);
 });
 
-test("overlay rejects arbitrary font families and inherited preset names", () => {
+test("overlay resolves free-form font families to a quoted literal plus system fallback", () => {
+    const fixture = loadOverlay();
+    fixture.send("stream-start", { streamId: 66, settings: { fontFamily: "PingFang SC" } });
+    fixture.workers[0].emit({
+        type: "comments", streamId: 66,
+        comments: [{ stime: 0, mode: 1, text: "custom" }]
+    });
+    const visible = fixture.manager.runline[0];
+    const expected = "'PingFang SC', " + FONT_PRESETS.system;
+    assert.equal(visible.dom.style.fontFamily, expected);
+    assert.ok(visible.dom.style.fontFamily.indexOf("'PingFang SC'") >= 0);
+    assert.ok(visible.dom.style.fontFamily.indexOf(FONT_PRESETS.system) >= 0);
+    fixture.send("style", { fontFamily: "Noto Sans SC" });
+    assert.equal(visible.dom.style.fontFamily, "'Noto Sans SC', " + FONT_PRESETS.system);
+});
+
+test("overlay sanitizes font families: unsafe strings fall back, safe literals are quoted", () => {
     const fixture = loadOverlay();
     fixture.send("stream-start", { streamId: 62, settings: { fontFamily: "mono" } });
     fixture.workers[0].emit({
         type: "comments", streamId: 62, comments: [{ stime: 0, mode: 1, text: "font" }]
     });
-    for (const fontFamily of ['url(https://example.com/font)', "toString", "__proto__"]) {
+    const visible = fixture.manager.runline[0];
+    for (const fontFamily of [
+        "url(https://example.com/font)",
+        'evil"; color: red; "',
+        "family{}",
+        "a,b;c",
+        "x".repeat(61),
+        "",
+        null,
+        42
+    ]) {
         fixture.send("style", { fontFamily });
-        assert.equal(fixture.manager.runline[0].font, FONT_PRESETS.system);
+        assert.equal(visible.font, FONT_PRESETS.system);
+    }
+    // Safe non-preset strings become quoted free-form literals with a system fallback.
+    for (const fontFamily of ["toString", "__proto__", "PingFang SC"]) {
+        fixture.send("style", { fontFamily });
+        assert.equal(visible.font, "'" + fontFamily + "', " + FONT_PRESETS.system);
     }
 });
 
@@ -275,15 +319,55 @@ test("stroke defaults and half-pixel updates do not resize or reset the renderer
     assert.equal(fixture.cssProperties["--danmaku-stroke-width"], "0.5px");
 });
 
-test("overlay CSS overrides stroke width after vendor styles without changing colors", () => {
+test("stroke color sanitization mirrors stroke width and applies on stream start", () => {
+    const fixture = loadOverlay();
+    fixture.send("stream-start", { streamId: 67 });
+    assert.equal(fixture.cssProperties["--danmaku-stroke-width"], "1px");
+    assert.equal(fixture.cssProperties["--danmaku-stroke-color"], "#000000");
+    fixture.send("style", { strokeColor: "#ff8800" });
+    assert.equal(fixture.cssProperties["--danmaku-stroke-color"], "#ff8800");
+    fixture.send("style", { strokeColor: "#00FF00" });
+    assert.equal(fixture.cssProperties["--danmaku-stroke-color"], "#00FF00");
+    for (const strokeColor of ["#fff", "red", "javascript:", "#ff88", "#ggg000", 123, null]) {
+        fixture.send("style", { strokeColor });
+        assert.equal(fixture.cssProperties["--danmaku-stroke-color"], "#000000");
+    }
+    fixture.send("stream-start", { streamId: 68, settings: { strokeColor: "#123abc" } });
+    assert.equal(fixture.cssProperties["--danmaku-stroke-color"], "#123abc");
+});
+
+test("user font and stroke settings never overwrite data-driven comment colors", () => {
+    const fixture = loadOverlay();
+    fixture.send("stream-start", { streamId: 69 });
+    fixture.workers[0].emit({
+        type: "comments", streamId: 69,
+        comments: [{ stime: 0, mode: 1, text: "colored", color: 0xff0000 }]
+    });
+    const visible = fixture.manager.runline[0];
+    assert.equal(visible.dom.style.color, "#ff0000");
+    fixture.send("style", { fontFamily: "serif", strokeColor: "#00ff00", strokeWidth: 2 });
+    assert.equal(visible.dom.style.color, "#ff0000");
+    assert.equal(visible.font, FONT_PRESETS.serif);
+    assert.equal(fixture.cssProperties["--danmaku-stroke-color"], "#00ff00");
+    assert.equal(fixture.cssProperties["--danmaku-stroke-width"], "2px");
+});
+
+test("overlay CSS stroke override targets base comments only and sets width and color vars", () => {
     const html = fs.readFileSync(path.join(__dirname, "..", "overlay", "danmaku.html"), "utf8");
     const css = html.match(/<style>([\s\S]*?)<\/style>/)[1];
     assert.ok(html.indexOf("vendor/ccl.min.css") < html.indexOf("<style>"));
-    const rule = css.match(/([^{}]+)\{\s*-webkit-text-stroke-width:\s*var\(--danmaku-stroke-width,\s*1px\);\s*\}/);
-    assert.ok(rule, "a width-only override preserves comment and stroke colors");
+    const rule = css.match(/([^{}]+)\{\s*-webkit-text-stroke-width:\s*var\(--danmaku-stroke-width,\s*1px\);\s*-webkit-text-stroke-color:\s*var\(--danmaku-stroke-color,\s*#000\);\s*\}/);
+    assert.ok(rule, "project override sets both stroke vars for base comments");
     assert.match(rule[1], /\.abp \.container \.cmt(?:\s*,|\s*$)/);
-    assert.match(rule[1], /\.abp \.container \.cmt\.reverse-shadow/);
-    assert.match(rule[1], /\.abp \.container \.cmt\.no-shadow/);
+    assert.ok(!/\.reverse-shadow/.test(rule[1]), "vendor reverse-shadow class keeps its own stroke");
+    assert.ok(!/\.no-shadow/.test(rule[1]), "vendor no-shadow class keeps its own stroke");
+    const vendorCss = fs.readFileSync(path.join(__dirname, "..", "overlay", "vendor", "ccl.min.css"), "utf8");
+    assert.ok(vendorCss.indexOf(".cmt.reverse-shadow") >= 0 &&
+        vendorCss.indexOf("-webkit-text-stroke:1px #fff") >= 0,
+        "vendor css defines reverse-shadow white stroke (data style source)");
+    assert.ok(vendorCss.indexOf(".cmt.no-shadow") >= 0 &&
+        vendorCss.indexOf("-webkit-text-stroke:0") >= 0,
+        "vendor css defines no-shadow zero stroke (data style source)");
 });
 
 test("overlay keeps stroke values within range and partial styles preserve typography", () => {

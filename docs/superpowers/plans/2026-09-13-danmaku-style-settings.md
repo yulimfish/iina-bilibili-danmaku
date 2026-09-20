@@ -20,6 +20,16 @@
 
 实机验证 BLOCKED — IINA 1.4.4 (build 168) 在 macOS 26.6.2 上调用 sidebar.loadFile() 时崩溃（EXC_BREAKPOINT/SIGTRAP in JavascriptAPISidebarView.loadFile）。崩溃报告：~/Library/Logs/DiagnosticReports/IINA-2026-09-20-230503.ips。已尝试：手动部署文件、完整重新部署、最小 HTML、.iinaplgz 包安装 — 均复现侧栏空白。崩溃发生在 IINA 原生 Swift 代码中，非插件 JavaScript 问题。82/82 自动化测试通过，独立 goal-verify 代码审计 PASS（无代码 BLOCKER）。实机验证待 IINA 修复或 macOS 兼容性解决后补做。
 
+## 状态更新（2026-09-21 · 二轮迭代）
+
+- 需求追加（用户反馈）：①描边颜色自定义 ②字体可选本机全部已安装字体 ③彩色弹幕文字颜色按数据 ④数据自带描边特殊样式时按数据 ⑤配置持久化启动补写重试。
+- 实现：fontFamily 改自由输入（datalist；main.js 经 utils.exec JXA NSFontManager 枚举系统字体，postMessage font-list，失败回退内置列表）；新增 strokeColor #RRGGBB（默认 #000000，描边行旁取色器）；overlay CSS 覆盖收窄至基础 .cmt（vendor .no-shadow/.reverse-shadow 数据样式优先，数据文字颜色 CCL setter 独占不被覆盖）；loadSettings 启动迁移：缺键或值被 normalize 修正即 saveSettings+sync。
+- 修复循环：goal-verify 首轮 FAIL——BLOCKER Info.json permissions 缺 "file-system"（utils.exec 依赖）已补；MAJOR vendor CSS 数据描边断言已补；MINOR（postFontList 去重、死 select CSS、sanitize 双端 trim+撇号排除、迁移回写断言）已修。复审 PASS，0 BLOCKER/MAJOR。
+- 验证：node --test tests/*.test.js 94/94；node --check 通过。实机持久化已验证：重启 IINA 后 plist 补写 strokeColor #000000，用户既有值（fontSize 23/opacity 50/speed 498/strokeWidth 1.5/fontFamily system）完整保留。
+- 仍 BLOCKED：IINA 1.4.4 sidebar.loadFile 崩溃致侧栏 webview 空白，字体枚举列表渲染、描边取色器、彩色弹幕实机显示效果无法在 UI 层验收；待 IINA 修复后补测。
+- 已知限制：字体名含括号（第三方字体常见）被 sanitizer 拒绝（枚举剔除/手输回退 system）；非法 fontFamily patch 重置为 system 而非保留旧值（设计行为）。
+- 代码在 feat/danmaku-style-settings 未提交（本轮迭代改动含 Info.json/main.js/sidebar/overlay/tests 共 8 文件）。
+
 ## 全局约束
 
 - 首期样式范围固定为字体预设与描边宽度；已有字号、透明度、速度、顶部/底部和显示开关保持兼容。

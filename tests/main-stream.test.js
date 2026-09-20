@@ -158,6 +158,14 @@ function loadMainFixture(options = {}) {
                     if (key === "settings") savedSettings = value;
                 },
                 sync() { preferenceSyncCalls += 1; }
+            },
+            utils: {
+                exec(command, args) {
+                    if (options.utilsExec) {
+                        return options.utilsExec(command, args);
+                    }
+                    return Promise.reject(new Error("utils.exec unavailable"));
+                }
             }
         }
     };
@@ -681,67 +689,101 @@ test("persists a settings patch and returns the merged settings to the sidebar",
 
     assert.equal(fixture.savedSettings.opacity, 80);
     assert.equal(fixture.savedSettings.fontSize, 32);
-    assert.equal(fixture.preferenceSyncCalls, 1);
+    assert.equal(fixture.savedSettings.fontFamily, "system");
+    assert.equal(fixture.savedSettings.strokeColor, "#000000");
+    // One sync for the startup migration save, one for the patch itself.
+    assert.equal(fixture.preferenceSyncCalls, 2);
     const settings = fixture.sidebarMessages.filter((message) => message.name === "settings");
     assert.equal(settings.at(-1).data.settings.fontSize, 32);
 });
 
 function currentSettings(fixture) {
     fixture.sidebarHandlers["sidebar-ready"]({});
-    return JSON.parse(JSON.stringify(fixture.sidebarMessages.at(-1).data.settings));
+    const messages = fixture.sidebarMessages.filter((message) => message.name === "settings");
+    return JSON.parse(JSON.stringify(messages.at(-1).data.settings));
 }
 
-test("upgrades legacy settings with default font and stroke", () => {
+test("upgrades legacy settings with default font, stroke and stroke color", () => {
     const settings = currentSettings(loadMainFixture({ settings: { opacity: 80 } }));
     assert.equal(settings.fontFamily, "system");
     assert.equal(settings.strokeWidth, 1);
+    assert.equal(settings.strokeColor, "#000000");
     assert.equal(settings.opacity, 80);
 });
 
-test("preserves all font presets and half-pixel stroke settings", () => {
-    for (const fontFamily of ["system", "sans", "serif", "rounded", "mono"]) {
+test("preserves preset ids, free-form family names and valid stroke colors", () => {
+    for (const fontFamily of ["system", "sans", "serif", "rounded", "mono",
+        "PingFang SC", "Hiragino Maru Gothic ProN", "toString", "Songti SC"]) {
         const settings = currentSettings(loadMainFixture({ settings: { fontFamily, strokeWidth: 2.5 } }));
         assert.equal(settings.fontFamily, fontFamily);
         assert.equal(settings.strokeWidth, 2.5);
     }
+    const trimmed = currentSettings(loadMainFixture({ settings: { fontFamily: "  PingFang SC  " } }));
+    assert.equal(trimmed.fontFamily, "PingFang SC");
+    for (const strokeColor of ["#FF8800", "#00ff00", "#000000"]) {
+        const settings = currentSettings(loadMainFixture({ settings: { strokeColor } }));
+        assert.equal(settings.strokeColor, strokeColor);
+    }
 });
 
 test("normalizes saved settings types, ranges and unknown keys", () => {
-    const settings = currentSettings(loadMainFixture({ settings: {
+    const fixture = loadMainFixture({ settings: {
         enabled: "false", showTop: false, showBottom: 0, fontSize: 100,
         opacity: -5, speed: 5000, offset: -100, fontFamily: "toString",
-        strokeWidth: 9, extra: true
-    } }));
+        strokeColor: "red", strokeWidth: 9, extra: true
+    } });
+    const settings = currentSettings(fixture);
     assert.deepEqual(settings, {
         enabled: true, showTop: false, showBottom: true, fontSize: 36,
-        opacity: 0, speed: 1200, offset: -30, fontFamily: "system", strokeWidth: 3
+        opacity: 0, speed: 1200, offset: -30, fontFamily: "toString",
+        strokeColor: "#000000", strokeWidth: 3
     });
+    assert.ok(fixture.savedSettings, "stale stored values trigger migration write-back");
+    assert.equal(fixture.savedSettings.fontSize, 36);
+    assert.equal(fixture.savedSettings.strokeWidth, 3);
+    assert.equal(fixture.savedSettings.strokeColor, "#000000");
     for (const invalid of [null, "2", NaN, Infinity, {}, []]) {
         const normalized = currentSettings(loadMainFixture({ settings: {
             strokeWidth: invalid, fontSize: invalid, opacity: invalid,
-            speed: invalid, offset: invalid, fontFamily: invalid
+            speed: invalid, offset: invalid
         } }));
         assert.equal(normalized.strokeWidth, 1);
         assert.equal(normalized.fontSize, 25);
         assert.equal(normalized.opacity, 100);
         assert.equal(normalized.speed, 680);
         assert.equal(normalized.offset, 0);
+    }
+    for (const invalid of [null, undefined, 2, NaN, true, {}, [],
+        "Arial; color:red", "url(https://x)", "url(X", "bad{}name",
+        "a<b", 'q"uote', "back\\slash", "line\nbreak", "apos'trophe",
+        "a".repeat(61)]) {
+        const normalized = currentSettings(loadMainFixture({ settings: { fontFamily: invalid } }));
         assert.equal(normalized.fontFamily, "system");
+    }
+    for (const invalid of ["#fff", "red", "FF0000", "#12345g", "#00000000", 123, null]) {
+        const normalized = currentSettings(loadMainFixture({ settings: { strokeColor: invalid } }));
+        assert.equal(normalized.strokeColor, "#000000");
     }
 });
 
 test("normalizes patches before persisting and restoring settings", () => {
     const fixture = loadMainFixture({ settings: { opacity: 80, fontFamily: "mono" } });
     fixture.sidebarHandlers["update-settings"]({ patch: {
-        fontFamily: "Arial; color:red", strokeWidth: -1, extra: true
+        fontFamily: "Arial; color:red", strokeWidth: -1, strokeColor: "blue", extra: true
     } });
     assert.equal(fixture.savedSettings.fontFamily, "system");
     assert.equal(fixture.savedSettings.strokeWidth, 0);
+    assert.equal(fixture.savedSettings.strokeColor, "#000000");
     assert.equal(fixture.savedSettings.opacity, 80);
     assert.equal("extra" in fixture.savedSettings, false);
-    fixture.sidebarHandlers["update-settings"]({ patch: { fontFamily: "serif", strokeWidth: 1.7 } });
+    fixture.sidebarHandlers["update-settings"]({ patch: {
+        fontFamily: "PingFang SC", strokeWidth: 1.7, strokeColor: "#00AAFF"
+    } });
+    assert.equal(fixture.savedSettings.fontFamily, "PingFang SC");
     assert.equal(fixture.savedSettings.strokeWidth, 1.5);
-    assert.equal(fixture.preferenceSyncCalls, 2);
+    assert.equal(fixture.savedSettings.strokeColor, "#00AAFF");
+    // Startup migration + two patch saves.
+    assert.equal(fixture.preferenceSyncCalls, 3);
     assert.deepEqual(currentSettings(loadMainFixture({ settings: fixture.savedSettings })), currentSettings(fixture));
 });
 
@@ -749,12 +791,16 @@ test("sends current font and stroke in pending streams and live style messages",
     const fixture = loadMainFixture({ manualOverlayReady: true });
     await fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
     await wait(5);
-    fixture.sidebarHandlers["update-settings"]({ patch: { fontFamily: "rounded", strokeWidth: 2 } });
+    fixture.sidebarHandlers["update-settings"]({ patch: {
+        fontFamily: "rounded", strokeWidth: 2, strokeColor: "#00ff00"
+    } });
     fixture.overlayHandlers["overlay-ready"]({});
     const stream = fixture.overlayMessages.find((message) => message.name === "stream-start");
     assert.equal(stream.data.settings.fontFamily, "rounded");
     assert.equal(stream.data.settings.strokeWidth, 2);
-    for (const patch of [{ fontFamily: "mono" }, { strokeWidth: 0.5 }, { fontSize: 30 }, { speed: 800 }]) {
+    assert.equal(stream.data.settings.strokeColor, "#00ff00");
+    for (const patch of [{ fontFamily: "mono" }, { strokeWidth: 0.5 }, { fontSize: 30 },
+        { speed: 800 }, { strokeColor: "#FF8800" }]) {
         const before = fixture.overlayMessages.length;
         fixture.sidebarHandlers["update-settings"]({ patch });
         const messages = fixture.overlayMessages.slice(before);
@@ -764,7 +810,96 @@ test("sends current font and stroke in pending streams and live style messages",
         assert.deepEqual(JSON.parse(JSON.stringify(messages[0].data)), {
             speed: settings.speed, fontSize: settings.fontSize,
             fontFamily: settings.fontFamily, strokeWidth: settings.strokeWidth,
+            strokeColor: settings.strokeColor,
             showTop: settings.showTop, showBottom: settings.showBottom
         });
     }
+    assert.equal(fixture.savedSettings.strokeColor, "#FF8800");
+});
+
+test("includes system font and black stroke color in the defaults", () => {
+    const settings = currentSettings(loadMainFixture());
+    assert.equal(settings.fontFamily, "system");
+    assert.equal(settings.strokeColor, "#000000");
+    assert.equal(settings.strokeWidth, 1);
+});
+
+test("migrates stored settings on startup when keys are missing or stale", () => {
+    const fixture = loadMainFixture({ settings: { fontSize: 25, opacity: 50 } });
+    assert.equal(fixture.savedSettings.fontFamily, "system");
+    assert.equal(fixture.savedSettings.strokeColor, "#000000");
+    assert.equal(fixture.savedSettings.fontSize, 25);
+    assert.equal(fixture.savedSettings.opacity, 50);
+    assert.equal(fixture.preferenceSyncCalls, 1);
+});
+
+test("migrates full default settings when nothing was stored yet", () => {
+    const fixture = loadMainFixture();
+    assert.deepEqual(JSON.parse(JSON.stringify(fixture.savedSettings)), {
+        enabled: true, showTop: true, showBottom: true, fontSize: 25,
+        fontFamily: "system", strokeWidth: 1, strokeColor: "#000000",
+        opacity: 100, speed: 680, offset: 0
+    });
+    assert.equal(fixture.preferenceSyncCalls, 1);
+});
+
+test("skips the migration save when stored settings are complete and valid", () => {
+    const full = {
+        enabled: true, showTop: true, showBottom: true,
+        fontSize: 25, fontFamily: "PingFang SC", strokeWidth: 1.5,
+        strokeColor: "#123abc", opacity: 80, speed: 680, offset: 0
+    };
+    const fixture = loadMainFixture({ settings: full });
+    assert.equal(fixture.savedSettings, null);
+    assert.equal(fixture.preferenceSyncCalls, 0);
+    assert.deepEqual(currentSettings(fixture), full);
+});
+
+test("sends the enumerated system font list to the sidebar", async () => {
+    const execCalls = [];
+    const fixture = loadMainFixture({
+        utilsExec: async (command, args) => {
+            execCalls.push({ command, args });
+            return {
+                status: 0,
+                stdout: JSON.stringify(["PingFang SC", " Songti SC ", 123,
+                    "bad;name", "url(Font)", "a".repeat(61), null]),
+                stderr: ""
+            };
+        }
+    });
+    await wait(0);
+
+    assert.equal(execCalls.length, 1);
+    assert.equal(execCalls[0].command, "osascript");
+    assert.deepEqual(JSON.parse(JSON.stringify(execCalls[0].args.slice(0, 3))), ["-l", "JavaScript", "-e"]);
+    assert.match(execCalls[0].args[3], /NSFontManager/);
+    const lists = fixture.sidebarMessages.filter((message) => message.name === "font-list");
+    assert.equal(lists.length >= 1, true);
+    assert.deepEqual(JSON.parse(JSON.stringify(lists.at(-1).data)), {
+        fonts: ["PingFang SC", "Songti SC"]
+    });
+
+    fixture.sidebarHandlers["sidebar-ready"]({});
+    const readyList = fixture.sidebarMessages
+        .filter((message) => message.name === "font-list").at(-1);
+    assert.deepEqual(JSON.parse(JSON.stringify(readyList.data)), {
+        fonts: ["PingFang SC", "Songti SC"]
+    });
+});
+
+test("sends a null font list when font enumeration fails", async () => {
+    const fixture = loadMainFixture({
+        utilsExec: async () => { throw new Error("osascript failed"); }
+    });
+    await wait(0);
+
+    const lists = fixture.sidebarMessages.filter((message) => message.name === "font-list");
+    assert.equal(lists.length >= 1, true);
+    assert.deepEqual(JSON.parse(JSON.stringify(lists.at(-1).data)), { fonts: null });
+
+    fixture.sidebarHandlers["sidebar-ready"]({});
+    const readyList = fixture.sidebarMessages
+        .filter((message) => message.name === "font-list").at(-1);
+    assert.deepEqual(JSON.parse(JSON.stringify(readyList.data)), { fonts: null });
 });

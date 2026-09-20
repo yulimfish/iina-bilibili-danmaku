@@ -5,7 +5,7 @@
 // M3: bangumi channel — search / ep-ss-md links -> seasons -> episodes -> cid.
 // M4: danmaku controls — toggle / font / opacity / speed / offset / clear.
 
-const { core, console, menu, sidebar, overlay, event, mpv, http, preferences } = iina;
+const { core, console, menu, sidebar, overlay, event, mpv, http, preferences, utils } = iina;
 
 const TAG = "[bili-danmaku]";
 const BILI_HEADERS = {
@@ -94,6 +94,7 @@ function initializeSidebar() {
 
     sidebar.onMessage("sidebar-ready", () => {
         console.log(TAG + " sidebar ready");
+        postFontList();
         sidebar.postMessage("state", { loaded: false, status: "idle" });
         sidebar.postMessage("settings", { settings: settings });
     });
@@ -152,14 +153,32 @@ const DEFAULT_SETTINGS = {
     showTop: true, // fixed top comments (mode 5)
     showBottom: true, // fixed bottom comments (mode 4)
     fontSize: 25, // px, replaces per-comment size
-    fontFamily: "system", // font preset identifier
+    fontFamily: "system", // preset id or installed font family name
     strokeWidth: 1, // px, 0-3 in half-pixel steps
+    strokeColor: "#000000", // text outline color, #RRGGBB
     opacity: 100, // 0-100
     speed: 680, // CCL scroll baseline; larger = faster
     offset: 0 // seconds added to playback position
 };
 
+const FONT_FAMILY_SANITIZER = /^[^;{}()<>\\",'\r\n]+$/;
+const FONT_FAMILY_MAX_LENGTH = 60;
+
 let settings = Object.assign({}, DEFAULT_SETTINGS);
+let fonts = null; // installed font families; null = enumeration unavailable
+
+// Returns a trimmed, injection-safe font family name, or null when invalid.
+function sanitizeFontFamily(value) {
+    if (typeof value !== "string") {
+        return null;
+    }
+    const trimmed = value.trim();
+    if (trimmed.length < 1 || trimmed.length > FONT_FAMILY_MAX_LENGTH ||
+        !FONT_FAMILY_SANITIZER.test(trimmed) || /url\(/i.test(trimmed)) {
+        return null;
+    }
+    return trimmed;
+}
 
 function normalizeSettings(candidate) {
     const normalized = Object.assign({}, DEFAULT_SETTINGS);
@@ -173,7 +192,12 @@ function normalizeSettings(candidate) {
         }
         const value = candidate[key];
         if (key === "fontFamily") {
-            if (["system", "sans", "serif", "rounded", "mono"].includes(value)) {
+            const family = sanitizeFontFamily(value);
+            if (family !== null) {
+                normalized[key] = family;
+            }
+        } else if (key === "strokeColor") {
+            if (typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value)) {
                 normalized[key] = value;
             }
         } else if (typeof DEFAULT_SETTINGS[key] === "boolean") {
@@ -193,7 +217,18 @@ function normalizeSettings(candidate) {
 
 function loadSettings() {
     try {
-        settings = normalizeSettings(preferences.get("settings"));
+        const stored = preferences.get("settings");
+        settings = normalizeSettings(stored);
+        // Rewrite the plist when stored settings predate new keys or normalize
+        // corrected a value, so updates migrate without any sidebar interaction.
+        const isPlain = Boolean(stored) && typeof stored === "object" && !Array.isArray(stored);
+        const needsMigration = !isPlain ||
+            !Object.prototype.hasOwnProperty.call(stored, "fontFamily") ||
+            !Object.prototype.hasOwnProperty.call(stored, "strokeColor") ||
+            Object.keys(DEFAULT_SETTINGS).some((key) => stored[key] !== settings[key]);
+        if (needsMigration) {
+            saveSettings();
+        }
     } catch (e) { /* ignore */ }
 }
 
@@ -210,6 +245,7 @@ function overlaySettings() {
         fontSize: settings.fontSize,
         fontFamily: settings.fontFamily,
         strokeWidth: settings.strokeWidth,
+        strokeColor: settings.strokeColor,
         showTop: settings.showTop,
         showBottom: settings.showBottom
     };
@@ -241,7 +277,8 @@ function applySettings(patch) {
         if ("showTop" in patch || "showBottom" in patch) {
             overlay.postMessage("filter", { showTop: settings.showTop, showBottom: settings.showBottom });
         }
-        if ("speed" in patch || "fontSize" in patch || "fontFamily" in patch || "strokeWidth" in patch) {
+        if ("speed" in patch || "fontSize" in patch || "fontFamily" in patch ||
+            "strokeWidth" in patch || "strokeColor" in patch) {
             overlay.postMessage("style", overlaySettings());
         }
         if ("offset" in patch) {
@@ -252,6 +289,50 @@ function applySettings(patch) {
 }
 
 loadSettings();
+
+function postFontList() {
+    sidebar.postMessage("font-list", { fonts: fonts });
+}
+
+function enumerateSystemFonts() {
+    const jxa = "ObjC.import('AppKit'); JSON.stringify($.NSFontManager.sharedFontManager.availableFontFamilies.js);";
+    let pending;
+    try {
+        pending = utils.exec("osascript", ["-l", "JavaScript", "-e", jxa]);
+    } catch (e) {
+        fonts = null;
+        postFontList();
+        return;
+    }
+    Promise.resolve(pending).then((result) => {
+        try {
+            const stdout = result && result.stdout;
+            const families = typeof stdout === "string" && stdout.trim() ? JSON.parse(stdout) : null;
+            if (!Array.isArray(families)) {
+                fonts = null;
+            } else {
+                const cleaned = [];
+                for (const name of families) {
+                    const family = sanitizeFontFamily(name);
+                    if (family !== null) {
+                        cleaned.push(family);
+                    }
+                    if (cleaned.length >= 500) {
+                        break;
+                    }
+                }
+                fonts = cleaned;
+            }
+        } catch (e) {
+            fonts = null;
+        }
+        postFontList();
+    }, () => {
+        fonts = null;
+        postFontList();
+    });
+}
+enumerateSystemFonts();
 
 function extractBvid(text) {
     const m = /BV[a-zA-Z0-9]{10}/.exec((text || "").trim());

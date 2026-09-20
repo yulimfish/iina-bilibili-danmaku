@@ -41,7 +41,7 @@ let commentHistory = [];
 // M4 overlay-side settings (mirrors main.js, applied on stream start / live update).
 let ov = {
     speed: 680, fontSize: 25, fontFamily: "system", strokeWidth: 1,
-    showTop: true, showBottom: true
+    strokeColor: "#000000", showTop: true, showBottom: true
 };
 
 // The plugin registers its overlay listeners after the navigation-finished
@@ -309,9 +309,34 @@ function applyFontSize() {
     });
 }
 
-function resolveFontFamily(preset) {
-    return Object.prototype.hasOwnProperty.call(FONT_PRESETS, preset)
-        ? FONT_PRESETS[preset] : FONT_PRESETS.system;
+// Free-form family names must survive the same defensive rule used upstream:
+// trimmed, length 1-60, no CSS/URL/quote metacharacters, no case-insensitive "url(".
+function sanitizeFontFamily(value) {
+    if (typeof value !== "string") {
+        return null;
+    }
+    const trimmed = value.trim();
+    if (trimmed.length < 1 || trimmed.length > 60) {
+        return null;
+    }
+    if (!/^[^;{}()<>\\",'\r\n]+$/.test(trimmed)) {
+        return null;
+    }
+    if (/url\(/i.test(trimmed)) {
+        return null;
+    }
+    return trimmed;
+}
+
+function resolveFontFamily(value) {
+    if (Object.prototype.hasOwnProperty.call(FONT_PRESETS, value)) {
+        return FONT_PRESETS[value];
+    }
+    const family = sanitizeFontFamily(value);
+    if (family !== null) {
+        return "'" + family + "', " + FONT_PRESETS.system;
+    }
+    return FONT_PRESETS.system;
 }
 
 function applyFontFamily() {
@@ -324,25 +349,43 @@ function applyFontFamily() {
     cm.runline.forEach((comment) => { comment.font = font; });
 }
 
-function applyStrokeWidth() {
+function sanitizeStrokeColor(value) {
+    return typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value)
+        ? value : "#000000";
+}
+
+function applyStrokeStyle() {
     document.documentElement.style.setProperty(
         "--danmaku-stroke-width", ov.strokeWidth + "px"
+    );
+    document.documentElement.style.setProperty(
+        "--danmaku-stroke-color", ov.strokeColor
     );
 }
 
 function updateTypography(data) {
     if (data.fontFamily !== undefined) {
-        const preset = Object.prototype.hasOwnProperty.call(FONT_PRESETS, data.fontFamily)
-            ? data.fontFamily : "system";
-        if (preset !== ov.fontFamily) {
-            ov.fontFamily = preset;
+        let family = "system";
+        if (Object.prototype.hasOwnProperty.call(FONT_PRESETS, data.fontFamily)) {
+            family = data.fontFamily;
+        } else {
+            const custom = sanitizeFontFamily(data.fontFamily);
+            if (custom !== null) {
+                family = custom;
+            }
+        }
+        if (family !== ov.fontFamily) {
+            ov.fontFamily = family;
             applyFontFamily();
         }
     }
     if (data.strokeWidth !== undefined && Number.isFinite(Number(data.strokeWidth))) {
         ov.strokeWidth = Math.round(Math.max(0, Math.min(3, Number(data.strokeWidth))) * 2) / 2;
     }
-    applyStrokeWidth();
+    if (data.strokeColor !== undefined) {
+        ov.strokeColor = sanitizeStrokeColor(data.strokeColor);
+    }
+    applyStrokeStyle();
 }
 
 function appendComments(streamId, comments, stats) {

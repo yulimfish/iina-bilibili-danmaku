@@ -18,7 +18,7 @@
   .hidden { display: none; }
   .section-title { font-weight: bold; margin: 8px 0 6px; }
   .row { display: flex; gap: 6px; margin: 6px 0; }
-  input[type="text"], select {
+  input[type="text"] {
     width: 100%; box-sizing: border-box; padding: 5px 6px;
     background: #222; color: #eee; border: 1px solid #555; border-radius: 4px;
   }
@@ -70,15 +70,32 @@
   <label class="opt"><input type="checkbox" id="set-bottom" checked> 底部弹幕</label>
   <label class="opt">字号 <span id="val-fontsize">25</span><input type="range" id="set-fontsize" min="18" max="36" value="25"></label>
   <label class="opt">字体
-    <select id="set-font-family">
-      <option value="system">系统默认</option>
-      <option value="sans">无衬线</option>
-      <option value="serif">宋体</option>
-      <option value="rounded">圆体</option>
-      <option value="mono">等宽</option>
-    </select>
+    <input type="text" id="set-font-family" list="font-family-list" placeholder="输入或选择字体">
   </label>
-  <label class="opt">描边 <span id="val-stroke">1px</span><input type="range" id="set-stroke" min="0" max="3" step="0.5" value="1"></label>
+  <datalist id="font-family-list">
+    <option value="system" label="系统默认"></option>
+    <option value="sans" label="无衬线"></option>
+    <option value="serif" label="宋体"></option>
+    <option value="rounded" label="圆体"></option>
+    <option value="mono" label="等宽"></option>
+    <option value="PingFang SC"></option>
+    <option value="Songti SC"></option>
+    <option value="Heiti SC"></option>
+    <option value="Hiragino Sans GB"></option>
+    <option value="Kaiti SC"></option>
+    <option value="Yuanti SC"></option>
+    <option value="Lantinghei SC"></option>
+    <option value="Microsoft YaHei"></option>
+    <option value="SimHei"></option>
+    <option value="Arial"></option>
+    <option value="Helvetica Neue"></option>
+    <option value="Menlo"></option>
+    <option value="Monaco"></option>
+    <option value="Times New Roman"></option>
+    <option value="Georgia"></option>
+    <option value="Courier New"></option>
+  </datalist>
+  <label class="opt">描边 <span id="val-stroke">1px</span><input type="range" id="set-stroke" min="0" max="3" step="0.5" value="1"><input type="color" id="set-stroke-color" value="#000000" style="width:48px; vertical-align:middle; background:transparent; border:none;"></label>
   <label class="opt">透明度 <span id="val-opacity">100</span><input type="range" id="set-opacity" min="0" max="100" value="100"></label>
   <label class="opt">速度 <span id="val-speed">680</span><input type="range" id="set-speed" min="200" max="1200" value="680"></label>
   <label class="opt">偏移 <span id="val-offset">0s</span><input type="range" id="set-offset" min="-30" max="30" value="0"></label>
@@ -200,6 +217,7 @@
     fontSize: document.getElementById("set-fontsize"),
     fontFamily: document.getElementById("set-font-family"),
     strokeWidth: document.getElementById("set-stroke"),
+    strokeColor: document.getElementById("set-stroke-color"),
     opacity: document.getElementById("set-opacity"),
     speed: document.getElementById("set-speed"),
     offset: document.getElementById("set-offset")
@@ -211,8 +229,9 @@
       showTop: ctl.showTop.checked,
       showBottom: ctl.showBottom.checked,
       fontSize: parseInt(ctl.fontSize.value, 10),
-      fontFamily: ctl.fontFamily.value,
+      fontFamily: ctl.fontFamily.value.trim(),
       strokeWidth: parseFloat(ctl.strokeWidth.value),
+      strokeColor: ctl.strokeColor.value,
       opacity: parseInt(ctl.opacity.value, 10),
       speed: parseInt(ctl.speed.value, 10),
       offset: parseInt(ctl.offset.value, 10)
@@ -255,10 +274,52 @@
     ctl.fontSize.value = s.fontSize;
     ctl.fontFamily.value = s.fontFamily;
     ctl.strokeWidth.value = s.strokeWidth;
+    ctl.strokeColor.value = /^#[0-9a-fA-F]{6}$/.test(s.strokeColor) ? s.strokeColor : "#000000";
     ctl.opacity.value = s.opacity;
     ctl.speed.value = s.speed;
     ctl.offset.value = s.offset;
     refreshValueLabels();
+  });
+
+  // font-list: main.js sends installed system fonts; keep presets, replace fallback fonts.
+  iina.onMessage("font-list", (data) => {
+    const fonts = data && data.fonts;
+    if (!Array.isArray(fonts) || fonts.length === 0) {
+      return;
+    }
+    const list = document.getElementById("font-family-list");
+    if (!list) {
+      return;
+    }
+    const presets = [
+      { value: "system", label: "系统默认" },
+      { value: "sans", label: "无衬线" },
+      { value: "serif", label: "宋体" },
+      { value: "rounded", label: "圆体" },
+      { value: "mono", label: "等宽" }
+    ];
+    const seen = new Set(presets.map((p) => p.value));
+    const extras = [];
+    for (const name of fonts) {
+      if (typeof name !== "string" || !name || seen.has(name)) {
+        continue;
+      }
+      seen.add(name);
+      extras.push(name);
+    }
+    while (list.firstChild) {
+      list.removeChild(list.firstChild);
+    }
+    const addOption = (value, label) => {
+      const opt = document.createElement("option");
+      opt.value = value;
+      if (label) {
+        opt.label = label;
+      }
+      list.appendChild(opt);
+    };
+    presets.forEach((p) => addOption(p.value, p.label));
+    extras.slice(0, 500 - presets.length).forEach((name) => addOption(name));
   });
 
   iina.postMessage("sidebar-ready", {});

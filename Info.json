@@ -15,7 +15,8 @@
     "permissions": [
         "show-osd",
         "video-overlay",
-        "network-request"
+        "network-request",
+        "file-system"
     ],
     "allowedDomains": [
         "api.bilibili.com"
