@@ -7,6 +7,13 @@ const COMMENT_BATCH_SIZE = 200;
 const FALLBACK_CHUNK_SIZE = 16 * 1024;
 const PROGRESS_INTERVAL = 400;
 const LATE_COMMENT_WINDOW = 1000;
+const FONT_PRESETS = {
+    system: '-apple-system, "PingFang SC", "Microsoft YaHei", sans-serif',
+    sans: 'Arial, "Helvetica Neue", sans-serif',
+    serif: 'Songti SC, "STSong", serif',
+    rounded: '"Hiragino Maru Gothic ProN", "Arial Rounded MT Bold", sans-serif',
+    mono: 'Menlo, Monaco, monospace'
+};
 
 let cm = null;
 let parserWorker = null;
@@ -32,7 +39,10 @@ let pendingComments = [];
 let commentHistory = [];
 
 // M4 overlay-side settings (mirrors main.js, applied on stream start / live update).
-let ov = { speed: 680, fontSize: 25, showTop: true, showBottom: true };
+let ov = {
+    speed: 680, fontSize: 25, fontFamily: "system", strokeWidth: 1,
+    showTop: true, showBottom: true
+};
 
 // The plugin registers its overlay listeners after the navigation-finished
 // event, so respond to a ping to prove this is the overlay webview (not the
@@ -299,6 +309,42 @@ function applyFontSize() {
     });
 }
 
+function resolveFontFamily(preset) {
+    return Object.prototype.hasOwnProperty.call(FONT_PRESETS, preset)
+        ? FONT_PRESETS[preset] : FONT_PRESETS.system;
+}
+
+function applyFontFamily() {
+    if (!cm) {
+        return;
+    }
+    const font = resolveFontFamily(ov.fontFamily);
+    // Timeline entries are shared with the pending queue and replay history.
+    cm.timeline.forEach((comment) => { comment.font = font; });
+    cm.runline.forEach((comment) => { comment.font = font; });
+}
+
+function applyStrokeWidth() {
+    document.documentElement.style.setProperty(
+        "--danmaku-stroke-width", ov.strokeWidth + "px"
+    );
+}
+
+function updateTypography(data) {
+    if (data.fontFamily !== undefined) {
+        const preset = Object.prototype.hasOwnProperty.call(FONT_PRESETS, data.fontFamily)
+            ? data.fontFamily : "system";
+        if (preset !== ov.fontFamily) {
+            ov.fontFamily = preset;
+            applyFontFamily();
+        }
+    }
+    if (data.strokeWidth !== undefined && Number.isFinite(Number(data.strokeWidth))) {
+        ov.strokeWidth = Math.round(Math.max(0, Math.min(3, Number(data.strokeWidth))) * 2) / 2;
+    }
+    applyStrokeWidth();
+}
+
 function appendComments(streamId, comments, stats) {
     if (streamId !== activeStreamId || !cm || !Array.isArray(comments)) {
         return;
@@ -308,6 +354,7 @@ function appendComments(streamId, comments, stats) {
         : -Infinity;
     comments.forEach((comment) => {
         comment.size = ov.fontSize;
+        comment.font = resolveFontFamily(ov.fontFamily);
         commentHistory.push(comment);
         if (comment.stime >= staleBefore) {
             pushPendingComment(comment);
@@ -535,6 +582,7 @@ function startParser(streamId) {
 }
 
 function updateSettings(data) {
+    updateTypography(data || {});
     if (!data) {
         return;
     }
@@ -627,6 +675,7 @@ iina.onMessage("style", (data) => {
     if (!data) {
         return;
     }
+    updateTypography(data);
     if (Number.isFinite(Number(data.speed)) && Number(data.speed) > 0 &&
         Number(data.speed) !== ov.speed) {
         ov.speed = Number(data.speed);

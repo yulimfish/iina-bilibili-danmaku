@@ -18,7 +18,7 @@
   .hidden { display: none; }
   .section-title { font-weight: bold; margin: 8px 0 6px; }
   .row { display: flex; gap: 6px; margin: 6px 0; }
-  input[type="text"] {
+  input[type="text"], select {
     width: 100%; box-sizing: border-box; padding: 5px 6px;
     background: #222; color: #eee; border: 1px solid #555; border-radius: 4px;
   }
@@ -69,6 +69,16 @@
   <label class="opt"><input type="checkbox" id="set-top" checked> 顶部弹幕</label>
   <label class="opt"><input type="checkbox" id="set-bottom" checked> 底部弹幕</label>
   <label class="opt">字号 <span id="val-fontsize">25</span><input type="range" id="set-fontsize" min="18" max="36" value="25"></label>
+  <label class="opt">字体
+    <select id="set-font-family">
+      <option value="system">系统默认</option>
+      <option value="sans">无衬线</option>
+      <option value="serif">宋体</option>
+      <option value="rounded">圆体</option>
+      <option value="mono">等宽</option>
+    </select>
+  </label>
+  <label class="opt">描边 <span id="val-stroke">1px</span><input type="range" id="set-stroke" min="0" max="3" step="0.5" value="1"></label>
   <label class="opt">透明度 <span id="val-opacity">100</span><input type="range" id="set-opacity" min="0" max="100" value="100"></label>
   <label class="opt">速度 <span id="val-speed">680</span><input type="range" id="set-speed" min="200" max="1200" value="680"></label>
   <label class="opt">偏移 <span id="val-offset">0s</span><input type="range" id="set-offset" min="-30" max="30" value="0"></label>
@@ -188,6 +198,8 @@
     showTop: document.getElementById("set-top"),
     showBottom: document.getElementById("set-bottom"),
     fontSize: document.getElementById("set-fontsize"),
+    fontFamily: document.getElementById("set-font-family"),
+    strokeWidth: document.getElementById("set-stroke"),
     opacity: document.getElementById("set-opacity"),
     speed: document.getElementById("set-speed"),
     offset: document.getElementById("set-offset")
@@ -199,6 +211,8 @@
       showTop: ctl.showTop.checked,
       showBottom: ctl.showBottom.checked,
       fontSize: parseInt(ctl.fontSize.value, 10),
+      fontFamily: ctl.fontFamily.value,
+      strokeWidth: parseFloat(ctl.strokeWidth.value),
       opacity: parseInt(ctl.opacity.value, 10),
       speed: parseInt(ctl.speed.value, 10),
       offset: parseInt(ctl.offset.value, 10)
@@ -207,6 +221,7 @@
 
   function refreshValueLabels() {
     document.getElementById("val-fontsize").textContent = ctl.fontSize.value;
+    document.getElementById("val-stroke").textContent = ctl.strokeWidth.value + "px";
     document.getElementById("val-opacity").textContent = ctl.opacity.value;
     document.getElementById("val-speed").textContent = ctl.speed.value;
     document.getElementById("val-offset").textContent = ctl.offset.value + "s";
@@ -238,6 +253,8 @@
     ctl.showTop.checked = s.showTop !== false;
     ctl.showBottom.checked = s.showBottom !== false;
     ctl.fontSize.value = s.fontSize;
+    ctl.fontFamily.value = s.fontFamily;
+    ctl.strokeWidth.value = s.strokeWidth;
     ctl.opacity.value = s.opacity;
     ctl.speed.value = s.speed;
     ctl.offset.value = s.offset;

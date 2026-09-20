@@ -8,6 +8,18 @@
 
 **技术栈：** IINA Sidebar WKWebView、IINA preferences、CommentCoreLibrary、CSS custom properties、Node.js `node:test`。
 
+## 当前状态（2026-09-20）
+
+- 分支：`feat/danmaku-style-settings`；实机环境：macOS 26.6.2、IINA 1.4.4 (168)。以下进度依据 workers 验证与独立审计结果更新。
+- Tasks 1–4 已实现并验证；测试先行已观察到 main/sidebar 初始 7 项失败及 overlay 初始失败。main/sidebar 33/33、overlay 33/33、overlay/sidebar 联合 36/36 通过。
+- 完整预检 82/82 通过，运行时代码语法检查通过。
+- 独立 `goal-verify` 只读代码审计已执行：代码 PASS，代码阻塞项为 0；整体验收为有条件通过，仍有 MAJOR：缺少实机证据。
+- 实机验证 **BLOCKED**：等待用户授权备份并替换工作区外已安装插件的四个运行时文件；字体/描边实机效果及重启持久化尚未验证。
+
+## 状态更新（2026-09-20）
+
+实机验证 BLOCKED — IINA 1.4.4 (build 168) 在 macOS 26.6.2 上调用 sidebar.loadFile() 时崩溃（EXC_BREAKPOINT/SIGTRAP in JavascriptAPISidebarView.loadFile）。崩溃报告：~/Library/Logs/DiagnosticReports/IINA-2026-09-20-230503.ips。已尝试：手动部署文件、完整重新部署、最小 HTML、.iinaplgz 包安装 — 均复现侧栏空白。崩溃发生在 IINA 原生 Swift 代码中，非插件 JavaScript 问题。82/82 自动化测试通过，独立 goal-verify 代码审计 PASS（无代码 BLOCKER）。实机验证待 IINA 修复或 macOS 兼容性解决后补做。
+
 ## 全局约束
 
 - 首期样式范围固定为字体预设与描边宽度；已有字号、透明度、速度、顶部/底部和显示开关保持兼容。
@@ -45,10 +57,10 @@ const FONT_PRESETS = {
 { fontFamily: "system", strokeWidth: 1 }
 ```
 
-- [ ] 在 `tests/main-stream.test.js` 添加失败测试：旧 settings 自动获得默认字体/描边；合法值保留；非法字体回退 `system`；描边被夹在 `0-3`。
-- [ ] 在 `main.js` 的 `DEFAULT_SETTINGS` 增加 `fontFamily` 与 `strokeWidth`。
-- [ ] 新增 `normalizeSettings(candidate)`，只复制已知键，并对布尔值、数值范围、字体枚举做规范化；`loadSettings()` 和 `applySettings()` 都通过它更新状态。
-- [ ] 扩展 `overlaySettings()` 与实时 `style` payload：
+- [x] 在 `tests/main-stream.test.js` 添加失败测试：旧 settings 自动获得默认字体/描边；合法值保留；非法字体回退 `system`；描边被夹在 `0-3`。
+- [x] 在 `main.js` 的 `DEFAULT_SETTINGS` 增加 `fontFamily` 与 `strokeWidth`。
+- [x] 新增 `normalizeSettings(candidate)`，只复制已知键，并对布尔值、数值范围、字体枚举做规范化；`loadSettings()` 和 `applySettings()` 都通过它更新状态。
+- [x] 扩展 `overlaySettings()` 与实时 `style` payload：
 
 ```js
 {
@@ -61,12 +73,12 @@ const FONT_PRESETS = {
 }
 ```
 
-- [ ] 运行 `node --test tests/main-stream.test.js`，预期设置升级、校验、持久化和消息测试全部通过。
+- [x] 运行 `node --test tests/main-stream.test.js`，预期设置升级、校验、持久化和消息测试全部通过。
 
 ### Task 2：增加侧边栏设置控件
 
-- [ ] 新建 `tests/sidebar-settings.test.js` 的最小 DOM/IINA fixture，先写失败测试：首次回填、字体 change patch、描边 change patch、显示标签同步。
-- [ ] 在 `sidebar/index.html` 的字号之后加入：
+- [x] 新建 `tests/sidebar-settings.test.js` 的最小 DOM/IINA fixture，先写失败测试：首次回填、字体 change patch、描边 change patch、显示标签同步。
+- [x] 在 `sidebar/index.html` 的字号之后加入：
 
 ```html
 <label class="opt">字体
@@ -83,14 +95,14 @@ const FONT_PRESETS = {
 </label>
 ```
 
-- [ ] 扩展 `ctl`、`patchFromUI()`、`refreshValueLabels()` 和 `settings` 回填，确保每次只提交发生变化的单个 key。
-- [ ] 为 `select` 添加与现有 input 一致的深色样式，但不改变现有页面结构和 tab 行为。
-- [ ] 运行 `node --test tests/sidebar-settings.test.js`，预期控件消息与回填测试全部通过。
+- [x] 扩展 `ctl`、`patchFromUI()`、`refreshValueLabels()` 和 `settings` 回填，确保每次只提交发生变化的单个 key。
+- [x] 为 `select` 添加与现有 input 一致的深色样式，但不改变现有页面结构和 tab 行为。
+- [x] 运行 `node --test tests/sidebar-settings.test.js`，预期控件消息与回填测试全部通过。
 
 ### Task 3：实时应用字体
 
-- [ ] 在 `tests/danmaku-overlay.test.js` 添加失败测试：首批、后续批次、`cm.timeline` 与 `cm.runline` 都使用最新字体；字体变化不创建新 Worker/manager。
-- [ ] 扩展 overlay 状态：
+- [x] 在 `tests/danmaku-overlay.test.js` 添加失败测试：首批、后续批次、`cm.timeline` 与 `cm.runline` 都使用最新字体；字体变化不创建新 Worker/manager。
+- [x] 扩展 overlay 状态：
 
 ```js
 let ov = {
@@ -103,14 +115,14 @@ let ov = {
 };
 ```
 
-- [ ] 新增 `resolveFontFamily(preset)` 与 `applyFontFamily()`，通过 CCL 的 `comment.font` setter 同时更新 `cm.timeline` 和 `cm.runline`。
-- [ ] 在 `appendComments()` 中为每条新 comment 设置 `font`；在 `updateSettings()` 和 `style` handler 中只在字体实际变化时调用 `applyFontFamily()`。
-- [ ] 运行 `node --test tests/danmaku-overlay.test.js`，预期字体即时应用且不触发重解析。
+- [x] 新增 `resolveFontFamily(preset)` 与 `applyFontFamily()`，通过 CCL 的 `comment.font` setter 同时更新 `cm.timeline` 和 `cm.runline`。
+- [x] 在 `appendComments()` 中为每条新 comment 设置 `font`；在 `updateSettings()` 和 `style` handler 中只在字体实际变化时调用 `applyFontFamily()`。
+- [x] 运行 `node --test tests/danmaku-overlay.test.js`，预期字体即时应用且不触发重解析。
 
 ### Task 4：用 CSS 变量应用描边
 
-- [ ] 扩展 overlay 测试 document fixture，使 `document.documentElement.style.setProperty()` 可观测；添加失败测试验证 `--danmaku-stroke-width`。
-- [ ] 在 `overlay/danmaku.html` 的 vendor CSS 之后加入项目级覆盖：
+- [x] 扩展 overlay 测试 document fixture，使 `document.documentElement.style.setProperty()` 可观测；添加失败测试验证 `--danmaku-stroke-width`。
+- [x] 在 `overlay/danmaku.html` 的 vendor CSS 之后加入项目级覆盖：
 
 ```css
 .abp .container .cmt {
@@ -118,7 +130,7 @@ let ov = {
 }
 ```
 
-- [ ] 新增 `applyStrokeWidth()`：
+- [x] 新增 `applyStrokeWidth()`：
 
 ```js
 document.documentElement.style.setProperty(
@@ -127,13 +139,13 @@ document.documentElement.style.setProperty(
 );
 ```
 
-- [ ] `stream-start` 和实时 `style` 消息都调用描边应用；只改描边不得调用 `resize()`、重启 Worker 或重置 manager。
-- [ ] 运行 `node --test tests/danmaku-overlay.test.js tests/sidebar-settings.test.js`，预期描边和 sidebar 测试全部通过。
+- [x] `stream-start` 和实时 `style` 消息都调用描边应用；只改描边不得调用 `resize()`、重启 Worker 或重置 manager。
+- [x] 运行 `node --test tests/danmaku-overlay.test.js tests/sidebar-settings.test.js`，预期描边和 sidebar 测试全部通过。
 
 ### Task 5：完整验证
 
-- [ ] 运行 `node --test tests/*.test.js`，预期 0 失败。
-- [ ] 运行 `node --check main.js && node --check overlay/danmaku.js`，预期全部退出码为 0。
+- [x] 运行 `node --test tests/*.test.js`，预期 0 失败。
+- [x] 运行 `node --check main.js && node --check overlay/danmaku.js`，预期全部退出码为 0。
 - [ ] 在 IINA 1.4.4 实机逐个切换五个字体预设和 `0/0.5/1/2/3px` 描边，确认在屏弹幕立即变化、彩色弹幕颜色保留、播放和解析不中断。
 - [ ] 重启 IINA，确认字体与描边持久化；旧版 settings 自动补齐默认值。
-- [ ] 运行全新 `goal-verify` 只读审计，覆盖需求、逻辑、边界、代码质量、测试有效性和实机结果。
+- [x] 运行全新 `goal-verify` 只读审计，覆盖需求、逻辑、边界、代码质量、测试有效性和实机结果。

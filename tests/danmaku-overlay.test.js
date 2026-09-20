@@ -23,6 +23,7 @@ function loadOverlay(options = {}) {
     const outgoing = [];
     const handlers = {};
     const workers = [];
+    const cssProperties = {};
     let manager = null;
     let providerCreated = 0;
     const animationFrames = [];
@@ -44,6 +45,7 @@ function loadOverlay(options = {}) {
             this.sendCalls = [];
             this.seekCalls = 0;
             this.clearCalls = 0;
+            this.boundsCalls = 0;
             this.timerValues = [];
             this.animations = [];
             manager = this;
@@ -67,19 +69,30 @@ function loadOverlay(options = {}) {
             if (options.throwOnSend) {
                 throw new Error("synthetic renderer failure");
             }
-            comments.forEach((comment) => {
+            const rendered = comments.map((data) => {
+                const comment = Object.assign({}, data);
                 const animations = [];
-                comment.dom = { getAnimations() { return animations; } };
+                comment.dom = { style: {}, getAnimations() { return animations; } };
+                comment.fontWrites = 0;
+                Object.defineProperty(comment, "font", {
+                    get() { return this.dom.style.fontFamily; },
+                    set(value) {
+                        this.fontWrites += 1;
+                        this.dom.style.fontFamily = value;
+                    }
+                });
+                comment.font = data.font;
                 requestAnimationFrame(() => {
                     const animation = { playbackRate: 1 };
                     animations.push(animation);
                     this.animations.push(animation);
                 });
+                return comment;
             });
             this.sendCalls.push(comments);
-            this.runline.push(...comments);
+            this.runline.push(...rendered);
         }
-        setBounds() {}
+        setBounds() { this.boundsCalls += 1; }
     }
 
     class FakeWorker {
@@ -102,6 +115,9 @@ function loadOverlay(options = {}) {
 
     const document = {
         hidden: false,
+        documentElement: {
+            style: { setProperty(name, value) { cssProperties[name] = value; } }
+        },
         getElementById() { return { offsetWidth: 1920 }; },
         addEventListener(name, handler) {
             if (name === "visibilitychange") {
@@ -139,6 +155,7 @@ function loadOverlay(options = {}) {
         send(name, data) { handlers[name](data); },
         outgoing,
         workers,
+        cssProperties,
         document,
         flushAnimationFrames() {
             while (animationFrames.length > 0) {
@@ -150,6 +167,145 @@ function loadOverlay(options = {}) {
         get providerCreated() { return providerCreated; }
     };
 }
+
+const FONT_PRESETS = {
+    system: '-apple-system, "PingFang SC", "Microsoft YaHei", sans-serif',
+    sans: 'Arial, "Helvetica Neue", sans-serif',
+    serif: 'Songti SC, "STSong", serif',
+    rounded: '"Hiragino Maru Gothic ProN", "Arial Rounded MT Bold", sans-serif',
+    mono: 'Menlo, Monaco, monospace'
+};
+
+for (const [preset, font] of Object.entries(FONT_PRESETS)) {
+    test(`overlay applies ${preset} to initial and later comment batches`, () => {
+        const fixture = loadOverlay();
+        fixture.send("stream-start", { streamId: 60, settings: { fontFamily: preset } });
+        for (let batch = 0; batch < 2; batch += 1) {
+            fixture.workers[0].emit({
+                type: "comments", streamId: 60,
+                comments: [{ stime: 0, mode: 1, text: String(batch), color: 0xff0000 }]
+            });
+        }
+        assert.equal(fixture.manager.timeline.length, 2);
+        for (const comment of [...fixture.manager.timeline, ...fixture.manager.runline]) {
+            assert.equal(comment.font, font);
+            assert.equal(comment.color, 0xff0000);
+        }
+    });
+}
+
+test("live fonts update visible, queued and replayed history without resetting parsing", () => {
+    const fixture = loadOverlay();
+    fixture.send("stream-start", { streamId: 61, initialTime: 5 });
+    const manager = fixture.manager;
+    const worker = fixture.workers[0];
+    worker.emit({
+        type: "comments", streamId: 61,
+        comments: [0, 5000, 7000].map((stime) => ({
+            stime, mode: 1, text: String(stime), color: 0x00ff00
+        }))
+    });
+    assert.equal(manager.runline[0].font, FONT_PRESETS.system);
+    const visible = manager.runline[0];
+    const clearCalls = manager.clearCalls;
+    const boundsCalls = manager.boundsCalls;
+    const lastMessage = worker.lastMessage;
+    for (const [preset, font] of Object.entries(FONT_PRESETS)) {
+        fixture.send("style", { fontFamily: preset });
+        assert.equal(visible.dom.style.fontFamily, font);
+        manager.timeline.forEach((comment) => assert.equal(comment.font, font));
+        const writes = visible.fontWrites;
+        fixture.send("style", { fontFamily: preset });
+        assert.equal(visible.fontWrites, writes, "unchanged fonts skip the setter");
+    }
+    worker.emit({
+        type: "comments", streamId: 61,
+        comments: [{ stime: 5000, mode: 1, text: "later", color: 0xff0000 }]
+    });
+    assert.equal(manager.runline.at(-1).font, FONT_PRESETS.mono);
+    assert.equal(manager.runline.at(-1).color, 0xff0000);
+    assert.equal(fixture.manager, manager);
+    assert.equal(manager.runline[0], visible);
+    assert.equal(manager.clearCalls, clearCalls);
+    assert.equal(manager.boundsCalls, boundsCalls);
+    assert.equal(fixture.workers.length, 1);
+    assert.equal(worker.terminated, undefined);
+    assert.equal(worker.lastMessage, lastMessage);
+    assert.equal(fixture.providerCreated, 0);
+    fixture.send("playback-state", playbackState(7));
+    assert.equal(manager.runline.at(-1).font, FONT_PRESETS.mono);
+    fixture.send("playback-state", playbackState(0, { revision: 1 }));
+    assert.equal(manager.runline[0].text, "0");
+    assert.equal(manager.runline[0].font, FONT_PRESETS.mono);
+    assert.equal(manager.runline[0].color, 0x00ff00);
+});
+
+test("overlay rejects arbitrary font families and inherited preset names", () => {
+    const fixture = loadOverlay();
+    fixture.send("stream-start", { streamId: 62, settings: { fontFamily: "mono" } });
+    fixture.workers[0].emit({
+        type: "comments", streamId: 62, comments: [{ stime: 0, mode: 1, text: "font" }]
+    });
+    for (const fontFamily of ['url(https://example.com/font)', "toString", "__proto__"]) {
+        fixture.send("style", { fontFamily });
+        assert.equal(fixture.manager.runline[0].font, FONT_PRESETS.system);
+    }
+});
+
+test("stroke defaults and half-pixel updates do not resize or reset the renderer", () => {
+    const fixture = loadOverlay();
+    fixture.send("stream-start", { streamId: 63 });
+    assert.equal(fixture.cssProperties["--danmaku-stroke-width"], "1px");
+    const manager = fixture.manager;
+    const worker = fixture.workers[0];
+    const clearCalls = manager.clearCalls;
+    const boundsCalls = manager.boundsCalls;
+    const lastMessage = worker.lastMessage;
+    for (const strokeWidth of [0, 0.5, 1, 1.5, 2, 2.5, 3]) {
+        fixture.send("style", { strokeWidth });
+        assert.equal(fixture.cssProperties["--danmaku-stroke-width"], `${strokeWidth}px`);
+    }
+    assert.equal(fixture.manager, manager);
+    assert.equal(manager.clearCalls, clearCalls);
+    assert.equal(manager.boundsCalls, boundsCalls);
+    assert.equal(fixture.workers.length, 1);
+    assert.equal(worker.terminated, undefined);
+    assert.equal(worker.lastMessage, lastMessage);
+    fixture.send("stream-start", { streamId: 64, settings: { strokeWidth: 0.5 } });
+    assert.equal(fixture.cssProperties["--danmaku-stroke-width"], "0.5px");
+});
+
+test("overlay CSS overrides stroke width after vendor styles without changing colors", () => {
+    const html = fs.readFileSync(path.join(__dirname, "..", "overlay", "danmaku.html"), "utf8");
+    const css = html.match(/<style>([\s\S]*?)<\/style>/)[1];
+    assert.ok(html.indexOf("vendor/ccl.min.css") < html.indexOf("<style>"));
+    const rule = css.match(/([^{}]+)\{\s*-webkit-text-stroke-width:\s*var\(--danmaku-stroke-width,\s*1px\);\s*\}/);
+    assert.ok(rule, "a width-only override preserves comment and stroke colors");
+    assert.match(rule[1], /\.abp \.container \.cmt(?:\s*,|\s*$)/);
+    assert.match(rule[1], /\.abp \.container \.cmt\.reverse-shadow/);
+    assert.match(rule[1], /\.abp \.container \.cmt\.no-shadow/);
+});
+
+test("overlay keeps stroke values within range and partial styles preserve typography", () => {
+    const fixture = loadOverlay();
+    fixture.send("stream-start", {
+        streamId: 65, settings: { fontFamily: "serif", strokeWidth: 2 }
+    });
+    for (const [strokeWidth, expected] of [[-1, 0], [4, 3], [1.2, 1], [1.7, 1.5]]) {
+        fixture.send("style", { strokeWidth });
+        assert.equal(fixture.cssProperties["--danmaku-stroke-width"], `${expected}px`);
+    }
+    for (const strokeWidth of [NaN, Infinity, "invalid"]) {
+        fixture.send("style", { strokeWidth });
+        assert.equal(fixture.cssProperties["--danmaku-stroke-width"], "1.5px");
+    }
+    fixture.send("style", { speed: 700, fontSize: 30 });
+    fixture.workers[0].emit({
+        type: "comments", streamId: 65, comments: [{ stime: 0, mode: 1, text: "partial" }]
+    });
+    assert.equal(fixture.manager.runline[0].font, FONT_PRESETS.serif);
+    assert.equal(fixture.cssProperties["--danmaku-stroke-width"], "1.5px");
+});
 
 test("overlay accepts comment batches without rebuilding a provider", () => {
     const fixture = loadOverlay();

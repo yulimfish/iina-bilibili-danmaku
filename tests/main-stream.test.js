@@ -685,3 +685,86 @@ test("persists a settings patch and returns the merged settings to the sidebar",
     const settings = fixture.sidebarMessages.filter((message) => message.name === "settings");
     assert.equal(settings.at(-1).data.settings.fontSize, 32);
 });
+
+function currentSettings(fixture) {
+    fixture.sidebarHandlers["sidebar-ready"]({});
+    return JSON.parse(JSON.stringify(fixture.sidebarMessages.at(-1).data.settings));
+}
+
+test("upgrades legacy settings with default font and stroke", () => {
+    const settings = currentSettings(loadMainFixture({ settings: { opacity: 80 } }));
+    assert.equal(settings.fontFamily, "system");
+    assert.equal(settings.strokeWidth, 1);
+    assert.equal(settings.opacity, 80);
+});
+
+test("preserves all font presets and half-pixel stroke settings", () => {
+    for (const fontFamily of ["system", "sans", "serif", "rounded", "mono"]) {
+        const settings = currentSettings(loadMainFixture({ settings: { fontFamily, strokeWidth: 2.5 } }));
+        assert.equal(settings.fontFamily, fontFamily);
+        assert.equal(settings.strokeWidth, 2.5);
+    }
+});
+
+test("normalizes saved settings types, ranges and unknown keys", () => {
+    const settings = currentSettings(loadMainFixture({ settings: {
+        enabled: "false", showTop: false, showBottom: 0, fontSize: 100,
+        opacity: -5, speed: 5000, offset: -100, fontFamily: "toString",
+        strokeWidth: 9, extra: true
+    } }));
+    assert.deepEqual(settings, {
+        enabled: true, showTop: false, showBottom: true, fontSize: 36,
+        opacity: 0, speed: 1200, offset: -30, fontFamily: "system", strokeWidth: 3
+    });
+    for (const invalid of [null, "2", NaN, Infinity, {}, []]) {
+        const normalized = currentSettings(loadMainFixture({ settings: {
+            strokeWidth: invalid, fontSize: invalid, opacity: invalid,
+            speed: invalid, offset: invalid, fontFamily: invalid
+        } }));
+        assert.equal(normalized.strokeWidth, 1);
+        assert.equal(normalized.fontSize, 25);
+        assert.equal(normalized.opacity, 100);
+        assert.equal(normalized.speed, 680);
+        assert.equal(normalized.offset, 0);
+        assert.equal(normalized.fontFamily, "system");
+    }
+});
+
+test("normalizes patches before persisting and restoring settings", () => {
+    const fixture = loadMainFixture({ settings: { opacity: 80, fontFamily: "mono" } });
+    fixture.sidebarHandlers["update-settings"]({ patch: {
+        fontFamily: "Arial; color:red", strokeWidth: -1, extra: true
+    } });
+    assert.equal(fixture.savedSettings.fontFamily, "system");
+    assert.equal(fixture.savedSettings.strokeWidth, 0);
+    assert.equal(fixture.savedSettings.opacity, 80);
+    assert.equal("extra" in fixture.savedSettings, false);
+    fixture.sidebarHandlers["update-settings"]({ patch: { fontFamily: "serif", strokeWidth: 1.7 } });
+    assert.equal(fixture.savedSettings.strokeWidth, 1.5);
+    assert.equal(fixture.preferenceSyncCalls, 2);
+    assert.deepEqual(currentSettings(loadMainFixture({ settings: fixture.savedSettings })), currentSettings(fixture));
+});
+
+test("sends current font and stroke in pending streams and live style messages", async () => {
+    const fixture = loadMainFixture({ manualOverlayReady: true });
+    await fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
+    await wait(5);
+    fixture.sidebarHandlers["update-settings"]({ patch: { fontFamily: "rounded", strokeWidth: 2 } });
+    fixture.overlayHandlers["overlay-ready"]({});
+    const stream = fixture.overlayMessages.find((message) => message.name === "stream-start");
+    assert.equal(stream.data.settings.fontFamily, "rounded");
+    assert.equal(stream.data.settings.strokeWidth, 2);
+    for (const patch of [{ fontFamily: "mono" }, { strokeWidth: 0.5 }, { fontSize: 30 }, { speed: 800 }]) {
+        const before = fixture.overlayMessages.length;
+        fixture.sidebarHandlers["update-settings"]({ patch });
+        const messages = fixture.overlayMessages.slice(before);
+        assert.equal(messages.length, 1);
+        assert.equal(messages[0].name, "style");
+        const settings = currentSettings(fixture);
+        assert.deepEqual(JSON.parse(JSON.stringify(messages[0].data)), {
+            speed: settings.speed, fontSize: settings.fontSize,
+            fontFamily: settings.fontFamily, strokeWidth: settings.strokeWidth,
+            showTop: settings.showTop, showBottom: settings.showBottom
+        });
+    }
+});
