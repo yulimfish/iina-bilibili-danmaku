@@ -152,6 +152,8 @@ const DEFAULT_SETTINGS = {
     showTop: true, // fixed top comments (mode 5)
     showBottom: true, // fixed bottom comments (mode 4)
     fontSize: 25, // px, replaces per-comment size
+    fontFamily: "system", // font preset identifier
+    strokeWidth: 1, // px, 0-3 in half-pixel steps
     opacity: 100, // 0-100
     speed: 680, // CCL scroll baseline; larger = faster
     offset: 0 // seconds added to playback position
@@ -159,12 +161,39 @@ const DEFAULT_SETTINGS = {
 
 let settings = Object.assign({}, DEFAULT_SETTINGS);
 
+function normalizeSettings(candidate) {
+    const normalized = Object.assign({}, DEFAULT_SETTINGS);
+    const ranges = { fontSize: [18, 36], opacity: [0, 100], speed: [200, 1200], offset: [-30, 30], strokeWidth: [0, 3] };
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+        return normalized;
+    }
+    Object.keys(DEFAULT_SETTINGS).forEach((key) => {
+        if (!Object.prototype.hasOwnProperty.call(candidate, key)) {
+            return;
+        }
+        const value = candidate[key];
+        if (key === "fontFamily") {
+            if (["system", "sans", "serif", "rounded", "mono"].includes(value)) {
+                normalized[key] = value;
+            }
+        } else if (typeof DEFAULT_SETTINGS[key] === "boolean") {
+            if (typeof value === "boolean") {
+                normalized[key] = value;
+            }
+        } else if (Number.isFinite(value)) {
+            const range = ranges[key];
+            normalized[key] = Math.max(range[0], Math.min(range[1], value));
+            if (key === "strokeWidth") {
+                normalized[key] = Math.round(normalized[key] * 2) / 2;
+            }
+        }
+    });
+    return normalized;
+}
+
 function loadSettings() {
     try {
-        const saved = preferences.get("settings");
-        if (saved && typeof saved === "object") {
-            settings = Object.assign({}, DEFAULT_SETTINGS, saved);
-        }
+        settings = normalizeSettings(preferences.get("settings"));
     } catch (e) { /* ignore */ }
 }
 
@@ -179,13 +208,18 @@ function overlaySettings() {
     return {
         speed: settings.speed,
         fontSize: settings.fontSize,
+        fontFamily: settings.fontFamily,
+        strokeWidth: settings.strokeWidth,
         showTop: settings.showTop,
         showBottom: settings.showBottom
     };
 }
 
 function applySettings(patch) {
-    Object.assign(settings, patch);
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
+        return;
+    }
+    settings = normalizeSettings(Object.assign(Object.create(null), settings, patch));
     saveSettings();
     if (pendingStream) {
         pendingStream.settings = overlaySettings();
@@ -207,8 +241,8 @@ function applySettings(patch) {
         if ("showTop" in patch || "showBottom" in patch) {
             overlay.postMessage("filter", { showTop: settings.showTop, showBottom: settings.showBottom });
         }
-        if ("speed" in patch || "fontSize" in patch) {
-            overlay.postMessage("style", { speed: settings.speed, fontSize: settings.fontSize });
+        if ("speed" in patch || "fontSize" in patch || "fontFamily" in patch || "strokeWidth" in patch) {
+            overlay.postMessage("style", overlaySettings());
         }
         if ("offset" in patch) {
             sendPlaybackState(true);
