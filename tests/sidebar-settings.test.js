@@ -274,12 +274,12 @@ test("font-list handler with null or empty fonts keeps the fallback panel", () =
     assert.ok(before.includes("PingFang SC"));
 });
 
-test("font-list handler caps total panel options at 500", () => {
+test("font-list handler caps total panel options at 1000", () => {
     const fixture = loadSidebarFixture();
-    const many = Array.from({ length: 900 }, (_, i) => "Font" + i);
+    const many = Array.from({ length: 1400 }, (_, i) => "Font" + i);
     fixture.handlers["font-list"]({ fonts: many });
     const values = panelValues(fixture);
-    assert.equal(values.length, 500);
+    assert.equal(values.length, 1000);
     assert.deepEqual(values.slice(0, 5), PRESET_FONTS);
     assert.equal(values[5], "Font0");
 });

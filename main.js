@@ -294,43 +294,142 @@ function postFontList() {
     sidebar.postMessage("font-list", { fonts: fonts });
 }
 
-function enumerateSystemFonts() {
-    const jxa = "ObjC.import('AppKit'); JSON.stringify($.NSFontManager.sharedFontManager.availableFontFamilies.js);";
-    let pending;
-    try {
-        pending = utils.exec("osascript", ["-l", "JavaScript", "-e", jxa]);
-    } catch (e) {
-        fonts = null;
-        postFontList();
-        return;
+const FONT_ENUM_CAP = 1000;
+const FONT_CACHE_KEY = "fontFamilies";
+const FONT_DIAG_KEY = "fontEnumDiag";
+// Ordered strategies after the in-process bridge probe: osascript +
+// NSFontManager + ObjC.deepUnwrap is verified to list every installed family
+// on this platform; the CoreText variant is kept as a second exec fallback.
+const FONT_ENUM_ATTEMPTS = [
+    {
+        name: "osascript-nsfontmanager",
+        jxa: "ObjC.import('AppKit'); JSON.stringify(Array.from(ObjC.deepUnwrap($.NSFontManager.sharedFontManager.availableFontFamilies) || []));"
+    },
+    {
+        name: "osascript-coretext",
+        jxa: "ObjC.import('CoreText'); JSON.stringify(Array.from(ObjC.deepUnwrap($.CTFontManagerCopyAvailableFontFamilyNames()) || []));"
     }
-    Promise.resolve(pending).then((result) => {
-        try {
-            const stdout = result && result.stdout;
-            const families = typeof stdout === "string" && stdout.trim() ? JSON.parse(stdout) : null;
-            if (!Array.isArray(families)) {
-                fonts = null;
-            } else {
-                const cleaned = [];
-                for (const name of families) {
-                    const family = sanitizeFontFamily(name);
-                    if (family !== null) {
-                        cleaned.push(family);
-                    }
-                    if (cleaned.length >= 500) {
-                        break;
-                    }
-                }
+];
+
+function cleanFontList(raw) {
+    if (!Array.isArray(raw)) {
+        return null;
+    }
+    const cleaned = [];
+    const seen = new Set();
+    for (const name of raw) {
+        const family = sanitizeFontFamily(name);
+        if (family !== null && !seen.has(family)) {
+            seen.add(family);
+            cleaned.push(family);
+        }
+        if (cleaned.length >= FONT_ENUM_CAP) {
+            break;
+        }
+    }
+    return cleaned.length > 0 ? cleaned : null;
+}
+
+function parseFontStdout(stdout) {
+    if (typeof stdout !== "string" || !stdout.trim()) {
+        return null;
+    }
+    let families;
+    try {
+        families = JSON.parse(stdout);
+    } catch (e) {
+        return null;
+    }
+    return cleanFontList(families);
+}
+
+function loadFontCache() {
+    try {
+        return cleanFontList(preferences.get(FONT_CACHE_KEY));
+    } catch (e) {
+        return null;
+    }
+}
+
+function persistFontDiagnostics(diag, cacheFonts) {
+    try {
+        if (cacheFonts) {
+            preferences.set(FONT_CACHE_KEY, cacheFonts);
+        }
+        preferences.set(FONT_DIAG_KEY, diag);
+        preferences.sync();
+    } catch (e) { /* ignore */ }
+}
+
+async function enumerateSystemFonts() {
+    const diag = { objcBridge: null, attempts: [], final: null, count: 0 };
+    // Probe 0: IINA evaluates plugins in JavaScriptCore; if the ObjC bridge
+    // happens to be enabled there we can enumerate in-process and skip exec.
+    try {
+        if (typeof $ === "undefined" || typeof ObjC === "undefined") {
+            diag.objcBridge = "absent";
+        } else {
+            ObjC.import("AppKit");
+            const cleaned = cleanFontList(
+                ObjC.deepUnwrap($.NSFontManager.sharedFontManager.availableFontFamilies)
+            );
+            if (cleaned) {
                 fonts = cleaned;
+                diag.objcBridge = "ok";
+                diag.final = "bridge";
+                diag.count = fonts.length;
+                persistFontDiagnostics(diag, fonts);
+                console.log(TAG + " font enum via in-process bridge count=" + fonts.length);
+                postFontList();
+                return;
+            }
+            diag.objcBridge = "empty";
+        }
+    } catch (e) {
+        diag.objcBridge = "error: " + String(e).slice(0, 120);
+    }
+    for (const attempt of FONT_ENUM_ATTEMPTS) {
+        try {
+            const result = await utils.exec("/usr/bin/osascript", ["-l", "JavaScript", "-e", attempt.jxa]);
+            const stdout = result && result.stdout;
+            const cleaned = parseFontStdout(stdout);
+            diag.attempts.push({
+                name: attempt.name,
+                status: result && result.status,
+                stdoutHead: typeof stdout === "string" ? stdout.slice(0, 120) : String(stdout),
+                count: cleaned ? cleaned.length : 0
+            });
+            console.log(TAG + " font enum " + attempt.name + " status=" + (result && result.status) +
+                " count=" + (cleaned ? cleaned.length : 0) +
+                " stdout=" + (typeof stdout === "string" ? stdout.slice(0, 120) : String(stdout)));
+            if (cleaned) {
+                fonts = cleaned;
+                diag.final = attempt.name;
+                diag.count = fonts.length;
+                persistFontDiagnostics(diag, fonts);
+                postFontList();
+                return;
             }
         } catch (e) {
-            fonts = null;
+            diag.attempts.push({ name: attempt.name, error: String(e).slice(0, 120) });
+            console.log(TAG + " font enum " + attempt.name + " failed: " + e);
         }
-        postFontList();
-    }, () => {
+    }
+    // Stale-while-error: a previously persisted full list outranks the
+    // built-in fallback when live enumeration is unavailable.
+    const cached = loadFontCache();
+    if (cached) {
+        fonts = cached;
+        diag.final = "cache";
+        diag.count = fonts.length;
+        console.log(TAG + " font enum unavailable; using cached list count=" + fonts.length);
+    } else {
         fonts = null;
-        postFontList();
-    });
+        diag.final = "fallback";
+        console.log(TAG + " font enum unavailable; sidebar keeps its fallback list");
+    }
+    persistFontDiagnostics(diag, null);
+    postFontList();
 }
 enumerateSystemFonts();
 

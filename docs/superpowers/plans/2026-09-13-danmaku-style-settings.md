@@ -30,6 +30,15 @@
 - 已知限制：字体名含括号（第三方字体常见）被 sanitizer 拒绝（枚举剔除/手输回退 system）；非法 fontFamily patch 重置为 system 而非保留旧值（设计行为）。
 - 代码在 feat/danmaku-style-settings 未提交（本轮迭代改动含 Info.json/main.js/sidebar/overlay/tests 共 8 文件）。
 
+## 状态更新（2026-09-21 · 三轮迭代 · 实机验收通过）
+
+- UI 修正：字体下拉弃用 datalist（WKWebView 不支持），改自定义下拉面板——聚焦展开全量列表、打字才过滤、点选发单键 patch；描边改为两行（提示字一行，滑块+圆形取色 chip 一行）；打开面板不再用已生效值做过滤（此前只剩「系统默认」的根因）。
+- 字体枚举根因闭环：IINA utils.exec 对裸命令名报「文件 Macintosh HD 不存在」，改绝对路径 /usr/bin/osascript 后 NSFontManager+ObjC.deepUnwrap 枚举成功；prefs 诊断字段 fontEnumDiag 实证 final=osascript-nsfontmanager、count=334。IINA 插件 JSC 无 ObjC 桥（objcBridge=absent）；JXA 取 NSArray 须用 ObjC.deepUnwrap()（.js 属性返回 null 数组，为二轮列表不全的根因之一）。
+- 稳健性：进程内桥探测优先（try/catch）→ exec 绝对路径链（NSFontManager 优先、CoreText 次之，Array.from 包裹）→ prefs fontFamilies 缓存兜底（stale-while-error）；上限 1000。
+- 验证：node --test 104/104；实机用户验收通过——侧栏字体下拉展示 334 个本机字体（含第三方），描边两行布局与圆形取色 chip 生效，设置持久化（plist 含 fontFamily/strokeWidth/strokeColor + fontFamilies 缓存）。
+- 剩余已知边界：彩色弹幕/数据描边样式的实机显示效果依赖 overlay 渲染路径，自动化仍无法截屏验收（侧栏/overlay webview 内容不对 AX 暴露），代码层已由 94+ 项单测覆盖数据优先规则。
+- 相关提交：626b396（二轮功能）、810a0d0（下拉与换行修复）、本轮枚举修复与文档更新一并提交。
+
 ## 全局约束
 
 - 首期样式范围固定为字体预设与描边宽度；已有字号、透明度、速度、顶部/底部和显示开关保持兼容。

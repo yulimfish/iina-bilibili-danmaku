@@ -133,6 +133,13 @@ function loadMainFixture(options = {}) {
             return name === "pause" ? Boolean(core.status.paused) : false;
         }
     };
+    const prefsStore = {};
+    if (options.settings !== undefined) {
+        prefsStore.settings = options.settings;
+    }
+    if (options.prefs) {
+        Object.assign(prefsStore, options.prefs);
+    }
     const context = {
         console,
         Date: { now: () => clock.now },
@@ -153,8 +160,11 @@ function loadMainFixture(options = {}) {
             mpv,
             http,
             preferences: {
-                get(key) { return key === "settings" ? options.settings || null : null; },
+                get(key) {
+                    return Object.prototype.hasOwnProperty.call(prefsStore, key) ? prefsStore[key] : null;
+                },
                 set(key, value) {
+                    prefsStore[key] = value;
                     if (key === "settings") savedSettings = value;
                 },
                 sync() { preferenceSyncCalls += 1; }
@@ -169,6 +179,9 @@ function loadMainFixture(options = {}) {
             }
         }
     };
+    if (options.globals) {
+        Object.assign(context, options.globals);
+    }
     if (options.parseJson) {
         context.JSON = { parse: options.parseJson, stringify: JSON.stringify };
     }
@@ -183,7 +196,8 @@ function loadMainFixture(options = {}) {
         set mpvPosition(value) { mpvPosition = value; },
         get setClickableCalls() { return setClickableCalls; },
         get savedSettings() { return savedSettings; },
-        get preferenceSyncCalls() { return preferenceSyncCalls; }
+        get preferenceSyncCalls() { return preferenceSyncCalls; },
+        get prefs() { return prefsStore; }
     };
 }
 
@@ -855,7 +869,7 @@ test("skips the migration save when stored settings are complete and valid", () 
     assert.deepEqual(currentSettings(fixture), full);
 });
 
-test("sends the enumerated system font list to the sidebar", async () => {
+test("sends the enumerated system font list to the sidebar and persists cache + diagnostics", async () => {
     const execCalls = [];
     const fixture = loadMainFixture({
         utilsExec: async (command, args) => {
@@ -863,22 +877,31 @@ test("sends the enumerated system font list to the sidebar", async () => {
             return {
                 status: 0,
                 stdout: JSON.stringify(["PingFang SC", " Songti SC ", 123,
-                    "bad;name", "url(Font)", "a".repeat(61), null]),
+                    "bad;name", "url(Font)", "a".repeat(61), null, "PingFang SC"]),
                 stderr: ""
             };
         }
     });
     await wait(0);
 
-    assert.equal(execCalls.length, 1);
-    assert.equal(execCalls[0].command, "osascript");
+    assert.equal(execCalls.length, 1, "first strategy succeeds, no fallback attempts");
+    assert.equal(execCalls[0].command, "/usr/bin/osascript",
+        "IINA utils.exec resolves bare names against its sandbox and fails; absolute path required");
     assert.deepEqual(JSON.parse(JSON.stringify(execCalls[0].args.slice(0, 3))), ["-l", "JavaScript", "-e"]);
     assert.match(execCalls[0].args[3], /NSFontManager/);
+    assert.match(execCalls[0].args[3], /deepUnwrap/);
+    assert.match(execCalls[0].args[3], /Array\.from/);
     const lists = fixture.sidebarMessages.filter((message) => message.name === "font-list");
     assert.equal(lists.length >= 1, true);
     assert.deepEqual(JSON.parse(JSON.stringify(lists.at(-1).data)), {
         fonts: ["PingFang SC", "Songti SC"]
     });
+    assert.deepEqual(JSON.parse(JSON.stringify(fixture.prefs.fontFamilies)),
+        ["PingFang SC", "Songti SC"], "full list cached in prefs");
+    assert.equal(fixture.prefs.fontEnumDiag.final, "osascript-nsfontmanager");
+    assert.equal(fixture.prefs.fontEnumDiag.count, 2);
+    assert.equal(fixture.prefs.fontEnumDiag.objcBridge, "absent");
+    assert.equal(fixture.prefs.fontEnumDiag.attempts.length, 1);
 
     fixture.sidebarHandlers["sidebar-ready"]({});
     const readyList = fixture.sidebarMessages
@@ -888,18 +911,126 @@ test("sends the enumerated system font list to the sidebar", async () => {
     });
 });
 
-test("sends a null font list when font enumeration fails", async () => {
+test("enumerates in-process when the plugin JS context exposes the ObjC bridge", async () => {
+    let execCount = 0;
     const fixture = loadMainFixture({
-        utilsExec: async () => { throw new Error("osascript failed"); }
+        utilsExec: async () => { execCount += 1; throw new Error("should not exec"); },
+        globals: {
+            $: { NSFontManager: { sharedFontManager: { availableFontFamilies: {} } } },
+            ObjC: {
+                import() {},
+                deepUnwrap() { return ["BridgeFont SC", "PingFang SC", "BridgeFont SC"]; }
+            }
+        }
+    });
+    await wait(0);
+
+    assert.equal(execCount, 0, "bridge path must skip utils.exec entirely");
+    const lists = fixture.sidebarMessages.filter((message) => message.name === "font-list");
+    assert.deepEqual(JSON.parse(JSON.stringify(lists.at(-1).data)), {
+        fonts: ["BridgeFont SC", "PingFang SC"]
+    });
+    assert.equal(fixture.prefs.fontEnumDiag.objcBridge, "ok");
+    assert.equal(fixture.prefs.fontEnumDiag.final, "bridge");
+    assert.deepEqual(JSON.parse(JSON.stringify(fixture.prefs.fontFamilies)),
+        ["BridgeFont SC", "PingFang SC"]);
+});
+
+test("falls through exec strategies when earlier ones fail", async () => {
+    const execCalls = [];
+    const fixture = loadMainFixture({
+        utilsExec: async (command, args) => {
+            execCalls.push({ command, args });
+            if (execCalls.length === 1) {
+                throw new Error("nsfontmanager blocked");
+            }
+            return { status: 0, stdout: JSON.stringify(["Menlo", "Kaiti SC"]), stderr: "" };
+        }
+    });
+    await wait(0);
+
+    assert.equal(execCalls.length, 2);
+    assert.match(execCalls[0].args[3], /NSFontManager/);
+    assert.match(execCalls[1].args[3], /CoreText/);
+    const lists = fixture.sidebarMessages.filter((message) => message.name === "font-list");
+    assert.deepEqual(JSON.parse(JSON.stringify(lists.at(-1).data)), {
+        fonts: ["Menlo", "Kaiti SC"]
+    });
+    assert.equal(fixture.prefs.fontEnumDiag.final, "osascript-coretext");
+    assert.equal(fixture.prefs.fontEnumDiag.attempts[0].error, "Error: nsfontmanager blocked");
+});
+
+test("caps the enumerated font list at 1000 unique sanitized entries", async () => {
+    const many = [];
+    for (let i = 0; i < 1500; i++) many.push("FontFamily" + i);
+    many.push("FontFamily0", "FontFamily1");
+    const fixture = loadMainFixture({
+        utilsExec: async () => ({ status: 0, stdout: JSON.stringify(many), stderr: "" })
     });
     await wait(0);
 
     const lists = fixture.sidebarMessages.filter((message) => message.name === "font-list");
+    const fonts = JSON.parse(JSON.stringify(lists.at(-1).data)).fonts;
+    assert.equal(fonts.length, 1000);
+    assert.equal(fonts[0], "FontFamily0");
+    assert.equal(new Set(fonts).size, 1000, "duplicates removed");
+});
+
+test("uses the persisted font cache when live enumeration is unavailable", async () => {
+    const execCalls = [];
+    const fixture = loadMainFixture({
+        utilsExec: async (command, args) => {
+            execCalls.push({ command, args });
+            throw new Error("osascript failed");
+        },
+        prefs: { fontFamilies: ["CachedFont A", "CachedFont B"] }
+    });
+    await wait(0);
+
+    assert.equal(execCalls.length, 2, "every live strategy is attempted before cache fallback");
+    const lists = fixture.sidebarMessages.filter((message) => message.name === "font-list");
+    assert.deepEqual(JSON.parse(JSON.stringify(lists.at(-1).data)), {
+        fonts: ["CachedFont A", "CachedFont B"]
+    });
+    assert.equal(fixture.prefs.fontEnumDiag.final, "cache");
+    assert.equal(fixture.prefs.fontEnumDiag.count, 2);
+});
+
+test("sends a null font list when enumeration and cache are both unavailable", async () => {
+    const execCalls = [];
+    const fixture = loadMainFixture({
+        utilsExec: async (command, args) => {
+            execCalls.push({ command, args });
+            throw new Error("osascript failed");
+        }
+    });
+    await wait(0);
+
+    assert.equal(execCalls.length, 2);
+    const lists = fixture.sidebarMessages.filter((message) => message.name === "font-list");
     assert.equal(lists.length >= 1, true);
     assert.deepEqual(JSON.parse(JSON.stringify(lists.at(-1).data)), { fonts: null });
+    assert.equal(fixture.prefs.fontEnumDiag.final, "fallback");
+    assert.equal(fixture.prefs.fontEnumDiag.attempts.length, 2);
 
     fixture.sidebarHandlers["sidebar-ready"]({});
     const readyList = fixture.sidebarMessages
         .filter((message) => message.name === "font-list").at(-1);
     assert.deepEqual(JSON.parse(JSON.stringify(readyList.data)), { fonts: null });
+});
+
+test("treats empty or non-array enumeration output as failure for that strategy", async () => {
+    const fixture = loadMainFixture({
+        utilsExec: async (command, args) => {
+            if (/NSFontManager/.test(args[3])) {
+                return { status: 0, stdout: "[]", stderr: "" };
+            }
+            return { status: 0, stdout: "null", stderr: "" };
+        }
+    });
+    await wait(0);
+
+    const lists = fixture.sidebarMessages.filter((message) => message.name === "font-list");
+    assert.deepEqual(JSON.parse(JSON.stringify(lists.at(-1).data)), { fonts: null });
+    assert.equal(fixture.prefs.fontEnumDiag.final, "fallback");
 });
