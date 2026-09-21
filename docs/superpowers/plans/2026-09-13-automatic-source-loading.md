@@ -8,6 +8,12 @@
 
 **技术栈：** IINA Plugin JavaScript、Bilibili Web API、IINA Sidebar/HUD、IINA preferences、Node.js `node:test`。
 
+## 状态更新（2026-09-21 · Task 1）
+
+- 已完成本地文件名解析：新增 `normalizeMediaTitle()`、`parseMediaFilename()` 和 `currentFileContext(url)`，按 BV、季集号、中文集号、尾部集号和显式分 P 识别，并清理扩展名、发布组、分辨率与编码标签。
+- 已覆盖计划中的标准番剧、季度番剧、中文集号、普通多 P、普通电影、BV-P 和低置信特殊篇样例；`mpv.getString("filename")` 优先于 URL，URL 回退安全解码。
+- 验证通过：`node --test tests/main-stream.test.js` 44/44、`node --test tests/*.test.js` 107/107、`node --check main.js`、`git diff --check`。
+
 ## 全局约束
 
 - 两个独立偏好：`autoLoadBangumi: false`、`autoLoadVideo: false`，升级后默认关闭。
@@ -47,7 +53,7 @@ function parseMediaFilename(filename) {
 }
 ```
 
-- [ ] 在 `tests/main-stream.test.js` 添加表驱动失败测试：
+- [x] 在 `tests/main-stream.test.js` 添加表驱动失败测试：
 
 ```text
 [ANi] 葬送的芙莉莲 - 12 [1080P][WEB-DL].mp4 -> title=葬送的芙莉莲, episode=12
@@ -59,9 +65,9 @@ BV1xx411c7mD-P2.mp4                       -> 精确 BV + part=2
 01.mp4 / NCOP.mkv / OVA.mp4               -> low，禁止自动加载
 ```
 
-- [ ] 在 `main.js` 新增 `normalizeMediaTitle()`、`parseMediaFilename()` 和 `currentFileContext(url)`；文件名优先从 `mpv.getString("filename")` 取得，事件 URL 与 `core.status.url` 只作回退并安全 decode。
-- [ ] 识别顺序固定为 BV、`SxxExx`、中文集号、标题尾部集号、显式 `Pxx/Part xx/分Pxx`；先去扩展名、发布组、分辨率、编码与音轨标签。
-- [ ] 运行 `node --test tests/main-stream.test.js`，预期全部纯函数样例通过。
+- [x] 在 `main.js` 新增 `normalizeMediaTitle()`、`parseMediaFilename()` 和 `currentFileContext(url)`；文件名优先从 `mpv.getString("filename")` 取得，事件 URL 与 `core.status.url` 只作回退并安全 decode。
+- [x] 识别顺序固定为 BV、`SxxExx`、中文集号、标题尾部集号、显式 `Pxx/Part xx/分Pxx`；先去扩展名、发布组、分辨率、编码与音轨标签。
+- [x] 运行 `node --test tests/main-stream.test.js`，预期全部纯函数样例通过。
 
 ### Task 2：分离文件、搜索与加载代际
 

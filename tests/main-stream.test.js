@@ -120,6 +120,7 @@ function loadMainFixture(options = {}) {
         osd(message) { osdMessages.push(message); },
         status: {
             idle: false,
+            url: options.statusUrl || "",
             position: options.position === undefined ? 0 : options.position,
             paused: options.paused === true,
             speed: options.speed === undefined ? 1 : options.speed
@@ -131,6 +132,9 @@ function loadMainFixture(options = {}) {
         },
         getFlag(name) {
             return name === "pause" ? Boolean(core.status.paused) : false;
+        },
+        getString(name) {
+            return name === "filename" ? (options.filename || "") : "";
         }
     };
     const prefsStore = {};
@@ -197,9 +201,212 @@ function loadMainFixture(options = {}) {
         get setClickableCalls() { return setClickableCalls; },
         get savedSettings() { return savedSettings; },
         get preferenceSyncCalls() { return preferenceSyncCalls; },
-        get prefs() { return prefsStore; }
+        get prefs() { return prefsStore; },
+        normalizeMediaTitle: context.normalizeMediaTitle,
+        parseMediaFilename: context.parseMediaFilename,
+        currentFileContext: context.currentFileContext
     };
 }
+
+test("parses local filenames into automatic source matching context", () => {
+    const parseMediaFilename = loadMainFixture().parseMediaFilename;
+    const cases = [
+        {
+            filename: "[ANi] 葬送的フリーレン - 12 [1080P][WEB-DL].mp4",
+            expected: {
+                title: "葬送的フリーレン",
+                seasonNumber: null,
+                episodeNumber: 12,
+                partNumber: null,
+                bvid: null,
+                kindHint: "bangumi",
+                confidence: "high"
+            }
+        },
+        {
+            filename: "鬼灭之刃.S02E03.1080p.mkv",
+            expected: {
+                title: "鬼灭之刃",
+                seasonNumber: 2,
+                episodeNumber: 3,
+                partNumber: null,
+                bvid: null,
+                kindHint: "bangumi",
+                confidence: "high"
+            }
+        },
+        {
+            filename: "凡人修仙传 年番 第45集.mp4",
+            expected: {
+                title: "凡人修仙传 年番",
+                seasonNumber: null,
+                episodeNumber: 45,
+                partNumber: null,
+                bvid: null,
+                kindHint: "bangumi",
+                confidence: "high"
+            }
+        },
+        {
+            filename: "纪录片.P03.2160p.mp4",
+            expected: {
+                title: "纪录片",
+                seasonNumber: null,
+                episodeNumber: null,
+                partNumber: 3,
+                bvid: null,
+                kindHint: "video",
+                confidence: "high"
+            }
+        },
+        {
+            filename: "纪录片.Part 04.2160p.mp4",
+            expected: {
+                title: "纪录片",
+                seasonNumber: null,
+                episodeNumber: null,
+                partNumber: 4,
+                bvid: null,
+                kindHint: "video",
+                confidence: "high"
+            }
+        },
+        {
+            filename: "纪录片.分P05.2160p.mp4",
+            expected: {
+                title: "纪录片",
+                seasonNumber: null,
+                episodeNumber: null,
+                partNumber: 5,
+                bvid: null,
+                kindHint: "video",
+                confidence: "high"
+            }
+        },
+        {
+            filename: "Movie.2024.2160p.WEB-DL.mkv",
+            expected: {
+                title: "Movie.2024",
+                seasonNumber: null,
+                episodeNumber: null,
+                partNumber: null,
+                bvid: null,
+                kindHint: "unknown",
+                confidence: "low"
+            }
+        },
+        {
+            filename: "BV1xx411c7mD-P2.mp4",
+            expected: {
+                title: "BV1xx411c7mD",
+                seasonNumber: null,
+                episodeNumber: null,
+                partNumber: 2,
+                bvid: "BV1xx411c7mD",
+                kindHint: "video",
+                confidence: "high"
+            }
+        },
+        ...["01.mp4", "NCOP.mkv", "OVA.mp4"].map((filename) => ({
+            filename,
+            expected: {
+                seasonNumber: null,
+                episodeNumber: null,
+                partNumber: null,
+                bvid: null,
+                kindHint: "unknown",
+                confidence: "low"
+            }
+        }))
+    ];
+
+    for (const { filename, expected } of cases) {
+        const result = parseMediaFilename(filename);
+        assert.equal(result.filename, filename);
+        for (const [key, value] of Object.entries(expected)) {
+            assert.equal(result[key], value, filename + " " + key);
+        }
+    }
+});
+
+test("current file context prefers mpv filename and safely decodes URL fallback", () => {
+    const fromMpv = loadMainFixture({
+        filename: "鬼灭之刃.S02E03.mkv"
+    }).currentFileContext("file:///tmp/other.mp4");
+    assert.equal(fromMpv.filename, "鬼灭之刃.S02E03.mkv");
+    assert.equal(fromMpv.seasonNumber, 2);
+    assert.equal(fromMpv.episodeNumber, 3);
+
+    const fromUrl = loadMainFixture().currentFileContext(
+        "file:///Users/test/%E8%91%AC%E9%80%81%E7%9A%84%E8%8A%B1%E7%81%AB%20-%2012.mkv"
+    );
+    assert.equal(fromUrl.filename, "葬送的花火 - 12.mkv");
+    assert.equal(fromUrl.title, "葬送的花火");
+    assert.equal(fromUrl.episodeNumber, 12);
+
+    const fromStatus = loadMainFixture({
+        statusUrl: "file:///Users/test/%E9%AC%BC%E7%81%AD%E4%B9%8B%E5%88%83.S02E03.mkv"
+    }).currentFileContext();
+    assert.equal(fromStatus.filename, "鬼灭之刃.S02E03.mkv");
+    assert.equal(fromStatus.seasonNumber, 2);
+
+    const malformedUrl = loadMainFixture().currentFileContext(
+        "file:///tmp/Show%ZZ%20-12.mkv"
+    );
+    assert.equal(malformedUrl.filename, "Show%ZZ -12.mkv");
+    assert.equal(malformedUrl.episodeNumber, 12);
+
+    const malformedUtf8Url = loadMainFixture().currentFileContext(
+        "file:///tmp/Show%E0%A4%A-%2012.mkv"
+    );
+    assert.equal(malformedUtf8Url.filename, "Show%E0%A4%A- 12.mkv");
+    assert.equal(malformedUtf8Url.episodeNumber, 12);
+});
+
+test("prioritizes BV ids and keeps ambiguous numeric titles out of episode matching", () => {
+    const parseMediaFilename = loadMainFixture().parseMediaFilename;
+
+    const bvid = parseMediaFilename("BV1xx411c7mD-01.mp4");
+    assert.equal(bvid.bvid, "BV1xx411c7mD");
+    assert.equal(bvid.episodeNumber, null);
+    assert.equal(bvid.seasonNumber, null);
+    assert.equal(bvid.kindHint, "video");
+    assert.equal(bvid.confidence, "high");
+
+    const technical = parseMediaFilename("Movie.H.264.mkv");
+    assert.equal(technical.title, "Movie");
+    assert.equal(technical.episodeNumber, null);
+    assert.equal(technical.confidence, "low");
+
+    for (const filename of [
+        "Movie.5.1.mkv",
+        "Movie.720.mkv",
+        "Movie.01.02.1080p.mkv",
+        "Movie.12.2024.2160p.WEB-DL.mkv"
+    ]) {
+        const result = parseMediaFilename(filename);
+        assert.equal(result.episodeNumber, null, filename);
+        assert.equal(result.confidence, "low", filename);
+    }
+
+    assert.equal(
+        parseMediaFilename("3 Body Problem S01E01.mkv").title,
+        "3 Body Problem"
+    );
+    assert.equal(
+        parseMediaFilename("The.100.S01E01.1080p.mkv").title,
+        "The.100"
+    );
+    const titleWithNumber = parseMediaFilename("The 100.mkv");
+    assert.equal(titleWithNumber.title, "The 100");
+    assert.equal(titleWithNumber.episodeNumber, null);
+    assert.equal(titleWithNumber.confidence, "low");
+
+    const trailingEpisode = parseMediaFilename("Show - 12.mkv");
+    assert.equal(trailingEpisode.title, "Show");
+    assert.equal(trailingEpisode.episodeNumber, 12);
+    assert.equal(trailingEpisode.confidence, "high");
+});
 
 test("main streams bounded chunks and throttles ordinary time updates", async () => {
     const fixture = loadMainFixture();

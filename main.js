@@ -433,6 +433,155 @@ async function enumerateSystemFonts() {
 }
 enumerateSystemFonts();
 
+const MEDIA_EXTENSIONS = /\.(?:3g2|3gp|avi|flv|m2ts|m4v|mkv|mov|mp4|mpeg|mpg|ts|webm|wmv)$/i;
+const MEDIA_TECHNICAL_TOKENS = /\b(?:WEB[-_. ]?DL|WEB[-_. ]?RIP|BLU[-_. ]?RAY|BDRIP|HDTV|HDRIP|REMASTER(?:ED)?|PROPER|LIMITED|UNCUT|AVC|HEVC|H\.?264|H\.?265|X264|X265|10BIT|AAC|FLAC|EAC3|DTS|HDR|SDR|UHD)\b/gi;
+const MEDIA_SEASON_EPISODE = /\bS(\d{1,2})\s*E(\d{1,3})\b/i;
+const MEDIA_CHINESE_EPISODE = /第\s*0*(\d{1,4})\s*(?:集|话|話|回)/;
+const MEDIA_CHINESE_PART = /分\s*P\s*0*(\d+)(?=$|[.\s_-])/i;
+const MEDIA_EXPLICIT_PART = /(?:^|[.\s_-])(?:Part|P)\s*0*(\d+)(?=$|[.\s_-])/i;
+const MEDIA_TRAILING_EPISODE = /(?:^|-)\s*0*(\d{1,3})\s*$/;
+
+function cleanMediaSource(filename) {
+    let source = typeof filename === "string" ? filename.trim() : "";
+    source = source.replace(MEDIA_EXTENSIONS, "");
+    source = source.replace(/\[[^\]]*\]/g, " ");
+    source = source.replace(/\b\d{3,4}p\b/gi, " ");
+    source = source.replace(/\b\d{3,4}x\d{3,4}\b/gi, " ");
+    source = source.replace(MEDIA_TECHNICAL_TOKENS, " ");
+    return source.trim();
+}
+
+function normalizeMediaTitle(filename) {
+    let title = cleanMediaSource(filename);
+    title = title.replace(MEDIA_SEASON_EPISODE, " ");
+    title = title.replace(MEDIA_CHINESE_EPISODE, " ");
+    title = title.replace(MEDIA_CHINESE_PART, " ");
+    title = title.replace(MEDIA_EXPLICIT_PART, " ");
+    const trailingEpisode = MEDIA_TRAILING_EPISODE.exec(title);
+    if (trailingEpisode) {
+        title = title.slice(0, trailingEpisode.index);
+    }
+    title = title.replace(/[|]+/g, " ");
+    title = title.replace(/\s*[-_]+\s*/g, " ");
+    title = title.replace(/[._]{2,}/g, ".");
+    title = title.replace(/\s+/g, " ");
+    return title.replace(/^[ ._-]+|[ ._-]+$/g, "").trim();
+}
+
+function buildMediaFilenameResult(filename, title, fields) {
+    const confident = title.length > 0 && fields.kindHint !== "unknown";
+    return {
+        filename: filename,
+        title: title,
+        seasonNumber: fields.seasonNumber,
+        episodeNumber: fields.episodeNumber,
+        partNumber: fields.partNumber,
+        bvid: fields.bvid,
+        kindHint: confident ? fields.kindHint : "unknown",
+        confidence: confident ? "high" : "low"
+    };
+}
+
+function parseMediaFilename(filename) {
+    const rawFilename = typeof filename === "string" ? filename.trim() : "";
+    const source = cleanMediaSource(rawFilename);
+    const title = normalizeMediaTitle(source);
+    const bvidMatch = /BV[a-zA-Z0-9]{10}/.exec(source);
+    const bvid = bvidMatch ? bvidMatch[0] : null;
+    const partMatch = MEDIA_CHINESE_PART.exec(source) || MEDIA_EXPLICIT_PART.exec(source);
+    const partNumber = partMatch ? Number(partMatch[1]) : null;
+    if (bvid) {
+        return buildMediaFilenameResult(rawFilename, title, {
+            seasonNumber: null,
+            episodeNumber: null,
+            partNumber: partNumber,
+            bvid: bvid,
+            kindHint: "video"
+        });
+    }
+
+    const seasonEpisodeMatch = MEDIA_SEASON_EPISODE.exec(source);
+    if (seasonEpisodeMatch) {
+        return buildMediaFilenameResult(rawFilename, title, {
+            seasonNumber: Number(seasonEpisodeMatch[1]),
+            episodeNumber: Number(seasonEpisodeMatch[2]),
+            partNumber: null,
+            bvid: null,
+            kindHint: "bangumi"
+        });
+    }
+
+    const chineseEpisodeMatch = MEDIA_CHINESE_EPISODE.exec(source);
+    if (chineseEpisodeMatch) {
+        return buildMediaFilenameResult(rawFilename, title, {
+            seasonNumber: null,
+            episodeNumber: Number(chineseEpisodeMatch[1]),
+            partNumber: null,
+            bvid: null,
+            kindHint: "bangumi"
+        });
+    }
+
+    const trailingEpisodeMatch = MEDIA_TRAILING_EPISODE.exec(source);
+    if (trailingEpisodeMatch && title.length > 0) {
+        return buildMediaFilenameResult(rawFilename, title, {
+            seasonNumber: null,
+            episodeNumber: Number(trailingEpisodeMatch[1]),
+            partNumber: null,
+            bvid: null,
+            kindHint: "bangumi"
+        });
+    }
+
+    return buildMediaFilenameResult(rawFilename, title, {
+        seasonNumber: null,
+        episodeNumber: null,
+        partNumber: partNumber,
+        bvid: null,
+        kindHint: partNumber !== null ? "video" : "unknown"
+    });
+}
+
+function safelyDecodeMediaSource(value) {
+    const text = typeof value === "string" ? value : "";
+    try {
+        return decodeURIComponent(text);
+    } catch (e) {
+        return text.replace(/(?:%[0-9a-fA-F]{2})+/g, (encodedRun) => {
+            try {
+                return decodeURIComponent(encodedRun);
+            } catch (decodeError) {
+                return encodedRun.replace(/%([0-9a-fA-F]{2})/g, (token, hex) => {
+                    return parseInt(hex, 16) < 0x80 ? String.fromCharCode(parseInt(hex, 16)) : token;
+                });
+            }
+        });
+    }
+}
+
+function mediaFilenameFromSource(value) {
+    let source = safelyDecodeMediaSource(String(value || "").replace(/[?#].*$/, ""));
+    source = source.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
+    const segments = source.split(/[\\/]/);
+    return segments[segments.length - 1] || source;
+}
+
+function currentFileContext(url) {
+    let filename = "";
+    try {
+        filename = mpv.getString("filename") || "";
+    } catch (e) { /* filename lookup is unavailable in some fixtures/versions */ }
+    if (!filename) {
+        const fallback = url || (core.status && core.status.url) || "";
+        filename = mediaFilenameFromSource(fallback);
+    } else {
+        filename = mediaFilenameFromSource(filename);
+    }
+    return Object.assign(parseMediaFilename(filename), {
+        url: url || (core.status && core.status.url) || null
+    });
+}
+
 function extractBvid(text) {
     const m = /BV[a-zA-Z0-9]{10}/.exec((text || "").trim());
     return m ? m[0] : null;
