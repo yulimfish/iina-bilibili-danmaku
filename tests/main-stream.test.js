@@ -196,6 +196,7 @@ function loadMainFixture(options = {}) {
     return {
         eventHandlers, sidebarHandlers, overlayHandlers, overlayMessages, sidebarMessages, osdMessages,
         clock, xmls, core: context.iina.core,
+        context,
         get mpvPosition() { return mpvPosition; },
         set mpvPosition(value) { mpvPosition = value; },
         get setClickableCalls() { return setClickableCalls; },
@@ -692,14 +693,148 @@ test("cancels scheduled chunks when a newer source starts", async () => {
     ), false);
 });
 
-test("cancels the current stream before a bangumi search starts", async () => {
+test("keeps the current stream while a bangumi search starts", async () => {
     const fixture = loadMainFixture();
     await fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
     await wait(0);
     const clearCount = fixture.overlayMessages.filter((message) => message.name === "clear").length;
     await fixture.sidebarHandlers["search-bangumi"]({ keyword: "demo" });
 
-    assert.equal(fixture.overlayMessages.filter((message) => message.name === "clear").length, clearCount + 1);
+    assert.equal(fixture.overlayMessages.filter((message) => message.name === "clear").length, clearCount);
+});
+
+test("publishes each distinct file context once", () => {
+    const fixture = loadMainFixture();
+
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Show%20-%201.mkv");
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Show%20-%201.mkv");
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Show%20-%202.mkv");
+
+    const contexts = fixture.sidebarMessages.filter((message) => message.name === "file-context");
+    assert.equal(contexts.length, 2);
+    assert.equal(contexts[0].data.context.title, "Show");
+    assert.equal(contexts[0].data.context.episodeNumber, 1);
+    assert.equal(contexts[1].data.context.episodeNumber, 2);
+});
+
+test("drops a stale search response after the file changes", async () => {
+    const response = deferred();
+    const fixture = loadMainFixture({
+        httpGet(url) {
+            if (url.includes("/x/web-interface/search/type")) {
+                return response.promise;
+            }
+            return undefined;
+        }
+    });
+
+    const search = fixture.sidebarHandlers["search-bangumi"]({ keyword: "old" });
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/new-file.mp4");
+    response.resolve(searchResponse("Old"));
+    await search;
+
+    assert.equal(fixture.sidebarMessages.filter((message) => message.name === "seasons").length, 0);
+});
+
+test("drops a stale search response after end-file", async () => {
+    const response = deferred();
+    const fixture = loadMainFixture({
+        httpGet(url) {
+            if (url.includes("/x/web-interface/search/type")) {
+                return response.promise;
+            }
+            return undefined;
+        }
+    });
+
+    const search = fixture.sidebarHandlers["search-bangumi"]({ keyword: "ended" });
+    fixture.eventHandlers["mpv.end-file"]({ reason: "eof" });
+    response.resolve(searchResponse("Ended"));
+    await search;
+
+    assert.equal(fixture.sidebarMessages.filter((message) => message.name === "seasons").length, 0);
+});
+
+test("reports asynchronous recognition failures without an unhandled rejection", async () => {
+    const fixture = loadMainFixture();
+    fixture.context.recognizeCurrentFile = () => Promise.reject(new Error("recognizer failed"));
+
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/recognition-failure.mp4");
+    await wait(0);
+
+    const errors = fixture.sidebarMessages.filter((message) => message.name === "error");
+    assert.equal(errors.length, 1);
+    assert.match(errors[0].data.message, /网络请求失败/);
+});
+
+test("drops a stale video detail response after the file changes", async () => {
+    const response = deferred();
+    const fixture = loadMainFixture({
+        httpGet(url) {
+            if (url.includes("/x/web-interface/view")) {
+                return response.promise;
+            }
+            return undefined;
+        }
+    });
+
+    const load = fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/new-file.mp4");
+    response.resolve({
+        statusCode: 200,
+        text: JSON.stringify({ code: 0, data: {
+            title: "Stale video",
+            pages: [{ page: 1, part: "", cid: 1 }]
+        } })
+    });
+    await load;
+
+    assert.equal(fixture.sidebarMessages.filter((message) => message.name === "video").length, 0);
+    assert.equal(fixture.overlayMessages.filter((message) => message.name === "stream-start").length, 0);
+    assert.deepEqual(fixture.osdMessages, []);
+});
+
+test("drops stale danmaku XML after the file changes", async () => {
+    const response = deferred();
+    const fixture = loadMainFixture({
+        httpGet(url) {
+            if (url.includes("/x/v1/dm/list.so")) {
+                return response.promise;
+            }
+            return undefined;
+        }
+    });
+
+    const load = fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
+    await wait(0);
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/new-file.mp4");
+    response.resolve({ statusCode: 200, text: "<i></i>" });
+    await load;
+    await wait(0);
+
+    assert.equal(fixture.overlayMessages.filter((message) => message.name === "stream-start").length, 0);
+    assert.equal(fixture.osdMessages.length, 0);
+});
+
+test("lets a manual source load supersede a pending search", async () => {
+    const response = deferred();
+    const fixture = loadMainFixture({
+        httpGet(url) {
+            if (url.includes("/x/web-interface/search/type")) {
+                return response.promise;
+            }
+            return undefined;
+        }
+    });
+
+    const search = fixture.sidebarHandlers["search-bangumi"]({ keyword: "pending" });
+    const load = fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
+    response.resolve(searchResponse("Stale search"));
+    await Promise.all([search, load]);
+    await wait(5);
+
+    assert.equal(fixture.sidebarMessages.filter((message) => message.name === "seasons").length, 0);
+    assert.equal(fixture.overlayMessages.filter((message) => message.name === "stream-start").length > 0, true);
 });
 
 test("keeps danmaku source handlers alive when the sidebar page loads late", async () => {

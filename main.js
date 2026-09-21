@@ -73,8 +73,8 @@ function initializeSidebar() {
         if (!data || !data.season_id) {
             return;
         }
-        const token = invalidateCurrentLoad();
-        return loadSeasonById(String(data.season_id), token, null);
+        const loadState = invalidateCurrentLoad();
+        return loadSeasonById(String(data.season_id), loadState, null);
     });
     sidebar.onMessage("select-part", (data) => {
         if (!video || !data) {
@@ -84,9 +84,9 @@ function initializeSidebar() {
         if (index < 0 || index >= video.parts.length || index === video.index) {
             return;
         }
-        const token = invalidateCurrentLoad();
-        return loadPart(index, token).catch((e) => {
-            if (token === loadToken) {
+        const loadState = invalidateCurrentLoad();
+        return loadPart(index, loadState).catch((e) => {
+            if (isCurrentLoad(loadState)) {
                 reportError(e);
             }
         });
@@ -131,7 +131,10 @@ let streamPumpGeneration = 0;
 let acknowledgeStreamChunk = null;
 let danmakuActive = false;
 let streamLoading = false;
-let loadToken = 0; // guards against overlapping loadSource calls
+let loadToken = 0; // guards against overlapping adopted source loads
+let fileGeneration = 0; // invalidates work from an older local file
+let searchGeneration = 0; // invalidates stale search results without clearing danmaku
+let currentFileIdentity = null;
 let pendingSearch = null;
 let playbackState = {
     time: null,
@@ -582,6 +585,57 @@ function currentFileContext(url) {
     });
 }
 
+function isCurrentFile(generation) {
+    return generation === fileGeneration;
+}
+
+function currentLoadState() {
+    return { token: loadToken, fileGeneration: fileGeneration };
+}
+
+function isCurrentLoad(state) {
+    return Boolean(state) && state.token === loadToken &&
+        isCurrentFile(state.fileGeneration);
+}
+
+function fileLoadedUrl(data) {
+    if (typeof data === "string") {
+        return data;
+    }
+    if (data && typeof data === "object") {
+        return data.url || data.path || data.filename || null;
+    }
+    return null;
+}
+
+// Task 3 supplies candidate fetching behind this asynchronous boundary. Keep
+// the boundary here so file-loaded never waits for network work.
+async function recognizeCurrentFile(context, generation) {
+    if (!isCurrentFile(generation)) {
+        return;
+    }
+    return context;
+}
+
+function handleFileLoaded(data) {
+    const context = currentFileContext(fileLoadedUrl(data));
+    const identity = context.url || context.filename || null;
+    if (!identity || identity === currentFileIdentity) {
+        return;
+    }
+
+    currentFileIdentity = identity;
+    fileGeneration += 1;
+    invalidateFileLoads();
+    const generation = fileGeneration;
+    sidebar.postMessage("file-context", { context: context, generation: generation });
+    Promise.resolve().then(() => recognizeCurrentFile(context, generation)).catch((e) => {
+        if (isCurrentFile(generation)) {
+            reportError(e);
+        }
+    });
+}
+
 function extractBvid(text) {
     const m = /BV[a-zA-Z0-9]{10}/.exec((text || "").trim());
     return m ? m[0] : null;
@@ -658,13 +712,16 @@ function partLabel(index) {
     return "第 " + (index + 1) + " P";
 }
 
-async function loadPart(index, token) {
+async function loadPart(index, loadState) {
+    if (!isCurrentLoad(loadState) || !video || index < 0 || index >= video.parts.length) {
+        return;
+    }
     video.index = index;
     const cid = video.parts[index].cid;
     const label = partLabel(index);
     sidebar.postMessage("status", { text: "正在获取弹幕数据（" + label + "）…" });
     const xml = await biliDanmakuXml(cid);
-    if (token !== loadToken) {
+    if (!isCurrentLoad(loadState)) {
         return; // superseded by a newer load
     }
     pushToOverlay(xml);
@@ -673,29 +730,29 @@ async function loadPart(index, token) {
 }
 
 async function loadSource(text) {
-    const token = invalidateCurrentLoad();
+    const loadState = invalidateCurrentLoad();
     if (core.status.idle) {
         sidebar.postMessage("error", { message: "请先播放本地视频，再加载弹幕" });
         return;
     }
     const bvid = extractBvid(text);
     if (bvid) {
-        await loadBvid(bvid, token);
+        await loadBvid(bvid, loadState);
         return;
     }
     const link = extractBangumiLink(text);
     if (link) {
-        await loadBangumiLink(link, token);
+        await loadBangumiLink(link, loadState);
         return;
     }
     sidebar.postMessage("error", { message: "无法识别：请输入 BV 号/视频链接，或番剧 ep/ss/md 链接" });
 }
 
-async function loadBvid(bvid, token) {
+async function loadBvid(bvid, loadState) {
     sidebar.postMessage("status", { text: "正在获取视频信息…" });
     try {
         const data = await biliApi("/x/web-interface/view", { bvid: bvid });
-        if (token !== loadToken) {
+        if (!isCurrentLoad(loadState)) {
             return;
         }
         video = {
@@ -707,9 +764,9 @@ async function loadBvid(bvid, token) {
         };
         console.log(TAG + " video: " + video.title + " (" + video.parts.length + " parts)");
         pushPartsToSidebar();
-        await loadPart(0, token);
+        await loadPart(0, loadState);
     } catch (e) {
-        if (token !== loadToken) {
+        if (!isCurrentLoad(loadState)) {
             return;
         }
         reportError(e);
@@ -756,7 +813,12 @@ function getBuvid() {
     return buvid;
 }
 
-async function searchBangumi(keyword, token) {
+function isCurrentSearch(state) {
+    return Boolean(state) && state.generation === searchGeneration &&
+        state.fileGeneration === fileGeneration;
+}
+
+async function searchBangumi(keyword, searchState) {
     keyword = (keyword || "").trim();
     if (!keyword) {
         sidebar.postMessage("error", { message: "请输入番剧名称" });
@@ -770,8 +832,8 @@ async function searchBangumi(keyword, token) {
                 "Referer": "https://search.bilibili.com/",
                 "Cookie": "buvid3=" + getBuvid()
             },
-            () => token !== loadToken);
-        if (data === null || token !== loadToken) {
+            () => !isCurrentSearch(searchState));
+        if (data === null || !isCurrentSearch(searchState)) {
             return;
         }
         const seasons = (data.result || []).map((r) => ({
@@ -787,7 +849,7 @@ async function searchBangumi(keyword, token) {
         sidebar.postMessage("seasons", { seasons: seasons });
         sidebar.postMessage("status", { text: "搜到 " + seasons.length + " 部番剧，请选择" });
     } catch (e) {
-        if (token === loadToken) {
+        if (isCurrentSearch(searchState)) {
             reportError(e);
         }
     }
@@ -795,12 +857,22 @@ async function searchBangumi(keyword, token) {
 
 function requestBangumiSearch(keyword) {
     const normalizedKeyword = (keyword || "").trim();
-    if (pendingSearch && pendingSearch.keyword === normalizedKeyword) {
+    if (pendingSearch && pendingSearch.keyword === normalizedKeyword &&
+        pendingSearch.fileGeneration === fileGeneration &&
+        pendingSearch.generation === searchGeneration) {
         return pendingSearch.promise;
     }
-    const token = invalidateCurrentLoad();
-    const promise = searchBangumi(normalizedKeyword, token);
-    pendingSearch = { keyword: normalizedKeyword, promise: promise };
+    const searchState = {
+        fileGeneration: fileGeneration,
+        generation: ++searchGeneration
+    };
+    const promise = searchBangumi(normalizedKeyword, searchState);
+    pendingSearch = {
+        keyword: normalizedKeyword,
+        promise: promise,
+        fileGeneration: searchState.fileGeneration,
+        generation: searchState.generation
+    };
     const clearPendingSearch = () => {
         if (pendingSearch && pendingSearch.promise === promise) {
             pendingSearch = null;
@@ -810,12 +882,12 @@ function requestBangumiSearch(keyword) {
     return promise;
 }
 
-async function loadSeasonById(seasonId, token, epId) {
+async function loadSeasonById(seasonId, loadState, epId) {
     sidebar.postMessage("status", { text: "正在获取番剧信息…" });
     try {
         const params = epId ? { ep_id: epId } : { season_id: seasonId };
         const result = await biliApi("/pgc/view/web/season", params);
-        if (token !== loadToken) {
+        if (!isCurrentLoad(loadState)) {
             return;
         }
         const episodes = (result.episodes || []).slice();
@@ -848,42 +920,42 @@ async function loadSeasonById(seasonId, token, epId) {
                 return;
             }
             pushPartsToSidebar();
-            await loadPart(idx, token);
+            await loadPart(idx, loadState);
         } else if (video.parts.length === 1) {
             pushPartsToSidebar();
-            await loadPart(0, token);
+            await loadPart(0, loadState);
         } else {
             pushPartsToSidebar();
             sidebar.postMessage("status", { text: "「" + video.title + "」共 " + video.parts.length + " 集，请选择分集" });
         }
     } catch (e) {
-        if (token === loadToken) {
+        if (isCurrentLoad(loadState)) {
             reportError(e);
         }
     }
 }
 
-async function loadBangumiLink(link, token) {
+async function loadBangumiLink(link, loadState) {
     try {
         if (link.type === "ep") {
-            await loadSeasonById(null, token, link.id);
+            await loadSeasonById(null, loadState, link.id);
         } else if (link.type === "ss") {
-            await loadSeasonById(link.id, token, null);
+            await loadSeasonById(link.id, loadState, null);
         } else {
             // md -> season_id via review API, then list episodes.
             sidebar.postMessage("status", { text: "正在解析 md 链接…" });
             const result = await biliApi("/pgc/review/user", { media_id: link.id });
-            if (token !== loadToken) {
+            if (!isCurrentLoad(loadState)) {
                 return;
             }
             const seasonId = result && result.media && result.media.season_id;
             if (!seasonId) {
                 throw { biliCode: -404, biliMessage: "该 md 链接找不到对应剧集" };
             }
-            await loadSeasonById(String(seasonId), token, null);
+            await loadSeasonById(String(seasonId), loadState, null);
         }
     } catch (e) {
-        if (token === loadToken) {
+        if (isCurrentLoad(loadState)) {
             reportError(e);
         }
     }
@@ -898,15 +970,27 @@ function cancelOverlayStream() {
     streamLoading = false;
 }
 
-function invalidateCurrentLoad() {
-    loadToken += 1;
-    pendingSearch = null;
+function clearCurrentStream() {
     cancelOverlayStream();
     danmakuActive = false;
     if (overlayLoaded) {
         overlay.postMessage("clear", {});
     }
-    return loadToken;
+}
+
+function invalidateFileLoads() {
+    searchGeneration += 1;
+    pendingSearch = null;
+    video = null;
+    clearCurrentStream();
+}
+
+function invalidateCurrentLoad() {
+    loadToken += 1;
+    searchGeneration += 1;
+    pendingSearch = null;
+    clearCurrentStream();
+    return currentLoadState();
 }
 
 function startOverlayStream(payload) {
@@ -1151,8 +1235,12 @@ event.on("mpv.window-scale.changed", () => {
     }
 });
 
+event.on("iina.file-loaded", handleFileLoaded);
+
 event.on("mpv.end-file", () => {
-    invalidateCurrentLoad();
+    fileGeneration += 1;
+    currentFileIdentity = null;
+    invalidateFileLoads();
     playbackState.time = null;
 });
 

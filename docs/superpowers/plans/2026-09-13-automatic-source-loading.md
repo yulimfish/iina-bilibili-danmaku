@@ -14,6 +14,13 @@
 - 已覆盖计划中的标准番剧、季度番剧、中文集号、普通多 P、普通电影、BV-P 和低置信特殊篇样例；`mpv.getString("filename")` 优先于 URL，URL 回退安全解码。
 - 验证通过：`node --test tests/main-stream.test.js` 44/44、`node --test tests/*.test.js` 107/107、`node --check main.js`、`git diff --check`。
 
+## 状态更新（2026-09-21 · Task 2）
+
+- 已分离三代状态：`fileGeneration` 使换片前的详情/XML请求失效，`searchGeneration` 只使搜索结果失效，`loadToken` 只由真正采用来源的操作递增并清理当前流。
+- `iina.file-loaded` 现在同步生成并发布 `file-context`，重复 identity 去重，再通过未等待的 `recognizeCurrentFile(context, generation)` 异步衔接后续识别；`mpv.end-file` 会递增文件代际并取消旧工作。
+- 后台/手动搜索不再清空当前弹幕；新的手动来源加载会立即使未完成搜索失效。候选获取逻辑留在 Task 3。
+- 验证通过：`node --test tests/main-stream.test.js` 51/51、`node --check main.js`、`git diff --check`。
+
 ## 全局约束
 
 - 两个独立偏好：`autoLoadBangumi: false`、`autoLoadVideo: false`，升级后默认关闭。
@@ -71,9 +78,9 @@ BV1xx411c7mD-P2.mp4                       -> 精确 BV + part=2
 
 ### Task 2：分离文件、搜索与加载代际
 
-- [ ] 添加失败测试：切换文件发生在搜索、详情或 XML 任一阶段时，旧响应都不能更新 sidebar、HUD 或 overlay。
-- [ ] 添加失败测试：后台推荐搜索不清空当前弹幕；自动搜索未完成时的手动选择立即获得优先权。
-- [ ] 在 `main.js` 引入：
+- [x] 添加失败测试：切换文件发生在搜索、详情或 XML 任一阶段时，旧响应都不能更新 sidebar、HUD 或 overlay。
+- [x] 添加失败测试：后台推荐搜索不清空当前弹幕；自动搜索未完成时的手动选择立即获得优先权。
+- [x] 在 `main.js` 引入：
 
 ```js
 let fileGeneration = 0;
@@ -86,10 +93,10 @@ function isCurrentFile(generation) {
 }
 ```
 
-- [ ] 将后台搜索从 `invalidateCurrentLoad()` 解耦；`loadToken` 只在用户或自动决策真正采用来源时递增并清空旧渲染流。
-- [ ] `iina.file-loaded` 中同步生成 identity、递增 `fileGeneration`、发布文件上下文，然后以未 await 的 Promise 启动 `recognizeCurrentFile(context, generation)` 并捕获错误。
-- [ ] 对重复 file-loaded identity 去重；`mpv.end-file` 递增 `fileGeneration` 使所有旧请求失效。
-- [ ] 运行 `node --test tests/main-stream.test.js`，预期所有竞态测试通过。
+- [x] 将后台搜索从 `invalidateCurrentLoad()` 解耦；`loadToken` 只在用户或自动决策真正采用来源时递增并清空旧渲染流。
+- [x] `iina.file-loaded` 中同步生成 identity、递增 `fileGeneration`、发布文件上下文，然后以未 await 的 Promise 启动 `recognizeCurrentFile(context, generation)` 并捕获错误。
+- [x] 对重复 file-loaded identity 去重；`mpv.end-file` 递增 `fileGeneration` 使所有旧请求失效。
+- [x] 运行 `node --test tests/main-stream.test.js`，预期所有竞态测试通过。
 
 ### Task 3：实现剧集与视频两类候选搜索
 
