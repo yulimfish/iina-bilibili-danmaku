@@ -24,6 +24,20 @@ function searchResponse(title, seasonId = 1) {
     };
 }
 
+function sourceSearchResponse(results) {
+    return {
+        statusCode: 200,
+        text: JSON.stringify({ code: 0, data: { result: results } })
+    };
+}
+
+function seasonDetailResponse(title, episodes) {
+    return {
+        statusCode: 200,
+        text: JSON.stringify({ code: 0, result: { title: title, episodes: episodes } })
+    };
+}
+
 function loadMainFixture(options = {}) {
     const eventHandlers = {};
     const sidebarHandlers = {};
@@ -119,7 +133,8 @@ function loadMainFixture(options = {}) {
         window: { loaded: options.windowLoadedInitially !== false },
         osd(message) { osdMessages.push(message); },
         status: {
-            idle: false,
+            idle: options.idle === true,
+            isNetworkResource: options.isNetworkResource === true,
             url: options.statusUrl || "",
             position: options.position === undefined ? 0 : options.position,
             paused: options.paused === true,
@@ -205,7 +220,11 @@ function loadMainFixture(options = {}) {
         get prefs() { return prefsStore; },
         normalizeMediaTitle: context.normalizeMediaTitle,
         parseMediaFilename: context.parseMediaFilename,
-        currentFileContext: context.currentFileContext
+        currentFileContext: context.currentFileContext,
+        fetchSearchCandidates: context.fetchSearchCandidates,
+        requestSourceSearch: context.requestSourceSearch,
+        rankCandidates: context.rankCandidates,
+        chooseAutoTarget: context.chooseAutoTarget
     };
 }
 
@@ -362,6 +381,422 @@ test("current file context prefers mpv filename and safely decodes URL fallback"
     );
     assert.equal(malformedUtf8Url.filename, "Show%E0%A4%A- 12.mkv");
     assert.equal(malformedUtf8Url.episodeNumber, 12);
+});
+
+test("fetches normalized bangumi and video candidates without UI side effects", async () => {
+    const requests = [];
+    const fixture = loadMainFixture({
+        httpGet(url, request) {
+            if (!url.includes("/x/web-interface/search/type")) return undefined;
+            requests.push(request);
+            if (request.params.search_type === "media_bangumi") {
+                return sourceSearchResponse([{ season_id: 12, title: "<em>Show</em>", pubtime: 0 }]);
+            }
+            return sourceSearchResponse([{ bvid: "BV1xx411c7mD", title: "<em>Show</em>", author: "owner" }]);
+        }
+    });
+
+    const bangumi = await fixture.fetchSearchCandidates("bangumi", "  Show  ", () => false);
+    const video = await fixture.fetchSearchCandidates("video", "  Show  ", () => false);
+
+    assert.equal(bangumi[0].kind, "bangumi");
+    assert.equal(bangumi[0].season_id, 12);
+    assert.equal(bangumi[0].title, "Show");
+    assert.equal(video[0].kind, "video");
+    assert.equal(video[0].bvid, "BV1xx411c7mD");
+    assert.equal(video[0].title, "Show");
+    assert.deepEqual(requests.map((request) => request.params.search_type), ["media_bangumi", "video"]);
+    assert.match(requests[0].headers.Cookie, /^buvid3=/);
+    assert.match(requests[1].headers.Cookie, /^buvid3=/);
+    assert.equal(fixture.sidebarMessages.some((message) => message.name === "seasons"), false);
+});
+
+test("caches each search kind for ten minutes and expires the cache", async () => {
+    let requests = 0;
+    const fixture = loadMainFixture({
+        httpGet(url) {
+            if (!url.includes("/x/web-interface/search/type")) return undefined;
+            requests += 1;
+            return sourceSearchResponse([{ season_id: requests, title: "Show", pubtime: 0 }]);
+        }
+    });
+
+    await fixture.fetchSearchCandidates("bangumi", "show", () => false);
+    await fixture.fetchSearchCandidates("bangumi", " SHOW ", () => false);
+    assert.equal(requests, 1);
+
+    fixture.clock.now = 10 * 60 * 1000 - 1;
+    await fixture.fetchSearchCandidates("bangumi", "show", () => false);
+    assert.equal(requests, 1);
+
+    fixture.clock.now = 10 * 60 * 1000;
+    await fixture.fetchSearchCandidates("bangumi", "show", () => false);
+    assert.equal(requests, 2);
+});
+
+test("does not merge pending searches across bangumi and video kinds", async () => {
+    const pending = [];
+    const fixture = loadMainFixture({
+        httpGet(url, request) {
+            if (!url.includes("/x/web-interface/search/type")) return undefined;
+            return new Promise((resolve) => pending.push({ request: request, resolve: resolve }));
+        }
+    });
+
+    const bangumi = fixture.requestSourceSearch("bangumi", "demo");
+    const video = fixture.requestSourceSearch("video", "demo");
+    assert.equal(pending.length, 2);
+    assert.deepEqual(pending.map((item) => item.request.params.search_type), ["media_bangumi", "video"]);
+
+    pending[0].resolve(sourceSearchResponse([{ season_id: 1, title: "Demo", pubtime: 0 }]));
+    pending[1].resolve(sourceSearchResponse([{ bvid: "BV1xx411c7mD", title: "Demo" }]));
+    await Promise.all([bangumi, video]);
+});
+
+test("ranks normalized title matches before season hints and keeps only three candidates", () => {
+    const fixture = loadMainFixture();
+    const ranked = fixture.rankCandidates({ title: "Demon Slayer", seasonNumber: 2 }, [
+        { kind: "bangumi", season_id: 1, title: "Demon Slayer", seasonNumber: 1 },
+        { kind: "bangumi", season_id: 2, title: "Demon Slayer", seasonNumber: 2 },
+        { kind: "bangumi", season_id: 3, title: "Demon Slayer Extra", seasonNumber: 2 },
+        { kind: "bangumi", season_id: 4, title: "Other Show", seasonNumber: 2 }
+    ]);
+
+    assert.deepEqual(ranked.map((candidate) => candidate.season_id), [2, 1, 3]);
+});
+
+test("uses episode and part hints after title similarity when ranking candidates", () => {
+    const fixture = loadMainFixture();
+    const ranked = fixture.rankCandidates({
+        title: "Show", seasonNumber: 2, episodeNumber: 3, partNumber: 2
+    }, [
+        {
+            id: "wrong-episode", kind: "bangumi", title: "Show", seasonNumber: 2,
+            episodes: [{ title: "2", cid: 1 }]
+        },
+        {
+            id: "exact", kind: "bangumi", title: "Show", seasonNumber: 2,
+            episodes: [{ title: "3", cid: 2 }],
+            pages: [{ page: 2, cid: 2 }]
+        },
+        {
+            id: "near", kind: "bangumi", title: "Show Extra", seasonNumber: 2,
+            episodes: [{ title: "3", cid: 3 }],
+            pages: [{ page: 2, cid: 3 }]
+        },
+        {
+            id: "wrong-part", kind: "bangumi", title: "Show", seasonNumber: 2,
+            episodes: [{ title: "3", cid: 4 }],
+            pages: [{ page: 1, cid: 4 }]
+        }
+    ]);
+
+    assert.deepEqual(ranked.map((candidate) => candidate.id), ["exact", "wrong-part", "wrong-episode"]);
+});
+
+test("chooses a unique bangumi episode when season and episode both match", () => {
+    const fixture = loadMainFixture();
+    const decision = fixture.chooseAutoTarget({
+        kindHint: "bangumi", title: "Demon Slayer", seasonNumber: 2, episodeNumber: 3
+    }, [{
+        kind: "bangumi", season_id: 2, title: "Demon Slayer", seasonNumber: 2,
+        episodes: [{ title: "3", long_title: "The Third Night", cid: 203 }]
+    }]);
+
+    assert.equal(decision.decision, "load");
+    assert.equal(decision.kind, "bangumi");
+    assert.equal(decision.partIndex, 0);
+    assert.equal(decision.confidence, "high");
+});
+
+test("loads the only high-confidence candidate that contains the requested episode", () => {
+    const fixture = loadMainFixture();
+    const decision = fixture.chooseAutoTarget({
+        kindHint: "bangumi", title: "Demon Slayer", seasonNumber: 2, episodeNumber: 3
+    }, [
+        {
+            kind: "bangumi", season_id: 2, title: "Demon Slayer", seasonNumber: 2,
+            episodes: [{ title: "2", cid: 202 }]
+        },
+        {
+            kind: "bangumi", season_id: 3, title: "Demon Slayer", seasonNumber: 2,
+            episodes: [{ title: "3", cid: 303 }]
+        }
+    ]);
+
+    assert.equal(decision.decision, "load");
+    assert.equal(decision.candidate.season_id, 3);
+    assert.equal(decision.partIndex, 0);
+});
+
+test("allows a unique bangumi match when search metadata omits the numeric season", () => {
+    const fixture = loadMainFixture();
+    const decision = fixture.chooseAutoTarget({
+        kindHint: "bangumi", title: "Demon Slayer", seasonNumber: 2, episodeNumber: 3
+    }, [{
+        kind: "bangumi", season_id: 2, title: "Demon Slayer",
+        episodes: [{ title: "3", cid: 203 }]
+    }]);
+
+    assert.equal(decision.decision, "load");
+    assert.equal(decision.partIndex, 0);
+});
+
+test("recommends bangumi candidates when the episode match is ambiguous", () => {
+    const fixture = loadMainFixture();
+    const decision = fixture.chooseAutoTarget({
+        kindHint: "bangumi", title: "Demon Slayer", seasonNumber: 2, episodeNumber: 3
+    }, [
+        {
+            kind: "bangumi", season_id: 2, title: "Demon Slayer", seasonNumber: 2,
+            episodes: [{ title: "3", cid: 203 }]
+        },
+        {
+            kind: "bangumi", season_id: 3, title: "Demon Slayer", seasonNumber: 2,
+            episodes: [{ title: "3", cid: 303 }]
+        }
+    ]);
+
+    assert.equal(decision.decision, "recommend");
+    assert.equal(decision.kind, "bangumi");
+    assert.equal(decision.candidates.length, 2);
+});
+
+test("loads an explicitly selected multi-part video and recommends when P is missing", () => {
+    const fixture = loadMainFixture();
+    const candidate = {
+        kind: "video", bvid: "BV1xx411c7mD", title: "Documentary",
+        pages: [{ page: 1, cid: 101 }, { page: 2, cid: 102 }]
+    };
+    const selected = fixture.chooseAutoTarget({
+        kindHint: "video", title: "Documentary", partNumber: 2
+    }, [candidate]);
+    const missingPart = fixture.chooseAutoTarget({
+        kindHint: "video", title: "Documentary", partNumber: null
+    }, [candidate]);
+
+    assert.equal(selected.decision, "load");
+    assert.equal(selected.partIndex, 1);
+    assert.equal(selected.confidence, "high");
+    assert.equal(missingPart.decision, "recommend");
+    assert.equal(missingPart.kind, "video");
+});
+
+test("uses resolved episode hints when choosing an automatic bangumi target", async () => {
+    const fixture = loadMainFixture({
+        httpGet(url, request) {
+            if (url.includes("/x/web-interface/search/type")) {
+                if (request.params.search_type === "video") {
+                    return sourceSearchResponse([]);
+                }
+                return sourceSearchResponse([
+                    { season_id: 1, title: "Show", pubtime: 0 },
+                    { season_id: 2, title: "Show", pubtime: 0 },
+                    { season_id: 3, title: "Show", pubtime: 0 }
+                ]);
+            }
+            if (url.includes("/pgc/view/web/season")) {
+                const episodes = {
+                    1: [{ id: 1, cid: 101, title: "2" }],
+                    2: [{ id: 2, cid: 102, title: "3" }],
+                    3: [{ id: 3, cid: 103, title: "1" }]
+                }[request.params.season_id];
+                return seasonDetailResponse("Show", episodes);
+            }
+            return undefined;
+        }
+    });
+
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Show.S02E03.mkv");
+    await wait(15);
+
+    const suggestions = fixture.sidebarMessages.filter((message) => message.name === "suggestions");
+    assert.equal(suggestions.length, 1);
+    assert.equal(suggestions[0].data.decision.decision, "load");
+    assert.equal(suggestions[0].data.decision.candidate.season_id, 2);
+});
+
+test("recognizes a local file, resolves only the top three details and posts the decision", async () => {
+    const detailRequests = [];
+    const searchTypes = [];
+    const fixture = loadMainFixture({
+        httpGet(url, request) {
+            if (url.includes("/x/web-interface/search/type")) {
+                searchTypes.push(request.params.search_type);
+                if (request.params.search_type === "video") {
+                    return sourceSearchResponse([{ bvid: "BV1xx411c7mD", title: "Show" }]);
+                }
+                return sourceSearchResponse([
+                    { season_id: 1, season_number: 2, title: "Show", pubtime: 0 },
+                    { season_id: 2, season_number: 1, title: "Show", pubtime: 0 },
+                    { season_id: 3, season_number: 2, title: "Show Extra", pubtime: 0 },
+                    { season_id: 4, season_number: 2, title: "Other Show", pubtime: 0 }
+                ]);
+            }
+            if (url.includes("/pgc/view/web/season")) {
+                detailRequests.push(request.params.season_id);
+                return seasonDetailResponse("Show", [{ id: 3, cid: 103, title: "3", long_title: "Night" }]);
+            }
+            return undefined;
+        }
+    });
+
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Show.S02E03.mkv");
+    await wait(10);
+
+    assert.equal(detailRequests.length, 3);
+    assert.deepEqual(searchTypes.sort(), ["media_bangumi", "video"]);
+    const suggestions = fixture.sidebarMessages.filter((message) => message.name === "suggestions");
+    assert.equal(suggestions.length, 1);
+    assert.equal(suggestions[0].data.decision.decision, "load");
+    assert.equal(suggestions[0].data.decision.partIndex, 0);
+    assert.equal(fixture.overlayMessages.some((message) => message.name === "stream-start"), false);
+});
+
+test("drops an automatic recommendation after a manual source load supersedes it", async () => {
+    const detail = deferred();
+    let detailStarted = false;
+    const fixture = loadMainFixture({
+        httpGet(url) {
+            if (url.includes("/x/web-interface/search/type")) {
+                return sourceSearchResponse([{ season_id: 1, title: "Show", pubtime: 0 }]);
+            }
+            if (url.includes("/pgc/view/web/season")) {
+                detailStarted = true;
+                return detail.promise;
+            }
+            return undefined;
+        }
+    });
+
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Show%20-%201.mkv");
+    await wait(0);
+    assert.equal(detailStarted, true);
+
+    await fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
+    detail.resolve(seasonDetailResponse("Show", [{ id: 1, cid: 101, title: "1" }]));
+    await wait(5);
+
+    assert.equal(fixture.sidebarMessages.filter((message) => message.name === "suggestions").length, 0);
+});
+
+test("does not start recognition after a manual load wins before recognition begins", async () => {
+    let searchRequests = 0;
+    const fixture = loadMainFixture({
+        httpGet(url) {
+            if (url.includes("/x/web-interface/search/type")) {
+                searchRequests += 1;
+            }
+            return undefined;
+        }
+    });
+
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Show%20-%201.mkv");
+    const load = fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
+    await load;
+    await wait(5);
+
+    assert.equal(searchRequests, 0);
+    assert.equal(fixture.sidebarMessages.filter((message) => message.name === "suggestions").length, 0);
+});
+
+test("recognizes a unique single-part video candidate and resolves its details", async () => {
+    let detailRequests = 0;
+    const fixture = loadMainFixture({
+        httpGet(url) {
+            if (url.includes("/x/web-interface/search/type")) {
+                return sourceSearchResponse([{ bvid: "BV1xx411c7mD", title: "Documentary" }]);
+            }
+            if (url.includes("/x/web-interface/view")) {
+                detailRequests += 1;
+                return {
+                    statusCode: 200,
+                    text: JSON.stringify({ code: 0, data: {
+                        title: "Documentary", pages: [{ page: 1, part: "", cid: 301 }]
+                    } })
+                };
+            }
+            return undefined;
+        }
+    });
+
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Documentary-P1.mp4");
+    await wait(10);
+
+    assert.equal(detailRequests, 1);
+    const suggestions = fixture.sidebarMessages.filter((message) => message.name === "suggestions");
+    assert.equal(suggestions.at(-1).data.decision.decision, "load");
+    assert.equal(suggestions.at(-1).data.decision.kind, "video");
+    assert.equal(suggestions.at(-1).data.decision.partIndex, 0);
+});
+
+test("drops automatic detail results after the file changes", async () => {
+    const oldDetail = deferred();
+    let oldDetailStarted = false;
+    const fixture = loadMainFixture({
+        httpGet(url, request) {
+            if (url.includes("/x/web-interface/search/type")) {
+                if (request.params.search_type === "video") {
+                    return sourceSearchResponse([]);
+                }
+                const title = request.params.keyword === "Other" ? "Other" : "Show";
+                return sourceSearchResponse([{
+                    season_id: title === "Other" ? 2 : 1, title: title, pubtime: 0
+                }]);
+            }
+            if (url.includes("/pgc/view/web/season")) {
+                if (request.params.season_id === 1) {
+                    oldDetailStarted = true;
+                    return oldDetail.promise;
+                }
+                return seasonDetailResponse("Other", [{ id: 2, cid: 202, title: "1" }]);
+            }
+            return undefined;
+        }
+    });
+
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Show%20-%201.mkv");
+    await wait(0);
+    assert.equal(oldDetailStarted, true);
+
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Other%20-%201.mkv");
+    await wait(10);
+    oldDetail.resolve(seasonDetailResponse("Show", [{ id: 1, cid: 101, title: "1" }]));
+    await wait(10);
+
+    const suggestions = fixture.sidebarMessages.filter((message) => message.name === "suggestions");
+    assert.equal(suggestions.length, 1);
+    assert.equal(suggestions[0].data.context.title, "Other");
+});
+
+test("uses an embedded BV id when title searches are unavailable", async () => {
+    let searchRequests = 0;
+    const fixture = loadMainFixture({
+        httpGet(url) {
+            if (url.includes("/x/web-interface/search/type")) {
+                searchRequests += 1;
+                throw new Error("search blocked");
+            }
+            if (url.includes("/x/web-interface/view")) {
+                return {
+                    statusCode: 200,
+                    text: JSON.stringify({ code: 0, data: {
+                        title: "Embedded video", pages: [{ page: 1, part: "", cid: 301 }]
+                    } })
+                };
+            }
+            return undefined;
+        }
+    });
+
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/BV1xx411c7mD-P1.mp4");
+    await wait(15);
+
+    const suggestions = fixture.sidebarMessages.filter((message) => message.name === "suggestions");
+    assert.equal(searchRequests, 2);
+    assert.equal(suggestions.length, 1);
+    assert.equal(suggestions[0].data.decision.decision, "load");
+    assert.equal(suggestions[0].data.decision.candidate.bvid, "BV1xx411c7mD");
 });
 
 test("prioritizes BV ids and keeps ambiguous numeric titles out of episode matching", () => {
@@ -589,6 +1024,31 @@ test("publishes an active playback snapshot and immediate discontinuity states",
     assert.deepEqual(JSON.parse(JSON.stringify(states.at(-1))), {
         time: 23, paused: false, rate: 2, seeking: false, revision: 2
     });
+});
+
+test("skips automatic recognition for idle, network and low-confidence files", async () => {
+    for (const options of [
+        { idle: true },
+        { isNetworkResource: true },
+        {}
+    ]) {
+        let searchRequests = 0;
+        const fixture = loadMainFixture(Object.assign({}, options, {
+            httpGet(url) {
+                if (url.includes("/x/web-interface/search/type")) {
+                    searchRequests += 1;
+                }
+                return undefined;
+            }
+        }));
+        const filename = options.idle || options.isNetworkResource
+            ? "Show - 1.mkv" : "Show.mkv";
+        fixture.eventHandlers["iina.file-loaded"]("file:///tmp/" + filename);
+        await wait(5);
+
+        assert.equal(searchRequests, 0);
+        assert.equal(fixture.sidebarMessages.filter((message) => message.name === "suggestions").length, 0);
+    }
 });
 
 test("forwards progressive parser phases to the sidebar status", async () => {
@@ -872,6 +1332,38 @@ test("coalesces repeated pending searches for the same normalized keyword", asyn
     response.resolve(searchResponse("Demo"));
     await Promise.all([first, second]);
     assert.equal(fixture.sidebarMessages.filter((message) => message.name === "seasons").length, 1);
+});
+
+test("coalesces an automatic search with a matching manual search", async () => {
+    const pending = [];
+    const fixture = loadMainFixture({
+        httpGet(url, request) {
+            if (url.includes("/x/web-interface/search/type")) {
+                return new Promise((resolve) => pending.push({
+                    type: request.params.search_type,
+                    resolve: resolve
+                }));
+            }
+            if (url.includes("/pgc/view/web/season")) {
+                return seasonDetailResponse("Show", [{ id: 1, cid: 101, title: "1" }]);
+            }
+            return undefined;
+        }
+    });
+
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Show%20-%201.mkv");
+    await wait(0);
+    assert.deepEqual(pending.map((item) => item.type).sort(), ["media_bangumi", "video"]);
+
+    const manual = fixture.sidebarHandlers["search-bangumi"]({ keyword: " Show " });
+    assert.equal(pending.length, 2);
+    pending.forEach((item) => item.resolve(item.type === "media_bangumi"
+        ? sourceSearchResponse([{ season_id: 1, title: "Show", pubtime: 0 }])
+        : sourceSearchResponse([{ bvid: "BV1xx411c7mD", title: "Show" }])));
+    await manual;
+    await wait(15);
+
+    assert.equal(fixture.sidebarMessages.filter((message) => message.name === "suggestions").length, 1);
 });
 
 test("drops stale search responses before parsing their JSON", async () => {

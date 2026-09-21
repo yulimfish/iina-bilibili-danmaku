@@ -69,6 +69,9 @@ function initializeSidebar() {
     sidebar.onMessage("search-bangumi", (data) => {
         return requestBangumiSearch(data && data.keyword);
     });
+    sidebar.onMessage("search-video", (data) => {
+        return requestSourceSearch("video", data && data.keyword);
+    });
     sidebar.onMessage("select-season", (data) => {
         if (!data || !data.season_id) {
             return;
@@ -135,7 +138,9 @@ let loadToken = 0; // guards against overlapping adopted source loads
 let fileGeneration = 0; // invalidates work from an older local file
 let searchGeneration = 0; // invalidates stale search results without clearing danmaku
 let currentFileIdentity = null;
-let pendingSearch = null;
+const pendingSearches = new Map();
+const SEARCH_CACHE_TTL = 10 * 60 * 1000;
+const searchCache = new Map();
 let playbackState = {
     time: null,
     paused: false,
@@ -608,13 +613,85 @@ function fileLoadedUrl(data) {
     return null;
 }
 
-// Task 3 supplies candidate fetching behind this asynchronous boundary. Keep
-// the boundary here so file-loaded never waits for network work.
-async function recognizeCurrentFile(context, generation) {
+async function recognizeCurrentFile(context, generation, recognitionSearchGeneration) {
     if (!isCurrentFile(generation)) {
         return;
     }
-    return context;
+    if (!context || core.status.idle || core.status.isNetworkResource ||
+        context.confidence !== "high") {
+        return;
+    }
+    const kind = context.kindHint === "video" || context.kindHint === "bangumi"
+        ? context.kindHint : null;
+    if (!kind || !context.title) {
+        return;
+    }
+
+    const expectedSearchGeneration = recognitionSearchGeneration === undefined
+        ? searchGeneration : recognitionSearchGeneration;
+    if (searchGeneration !== expectedSearchGeneration) {
+        return;
+    }
+    const isStale = () => !isCurrentFile(generation) ||
+        searchGeneration !== expectedSearchGeneration;
+    const searchKinds = ["bangumi", "video"];
+    const requests = searchKinds.map((searchKind) => requestSearchCandidates(
+        searchKind, context.title, expectedSearchGeneration
+    ));
+    if (requests.some((request) => !request.state)) {
+        return;
+    }
+    let searchResults;
+    try {
+        searchResults = await Promise.all(requests.map((request) => request.promise));
+    } catch (e) {
+        if (isStale()) {
+            return;
+        }
+        if (!(kind === "video" && context.bvid)) {
+            throw e;
+        }
+        // An embedded BV id is authoritative even when title search is blocked.
+        searchResults = [[], []];
+    }
+    if (isStale()) {
+        return;
+    }
+
+    let candidates = searchResults.reduce((all, result) => all.concat(result || []), [])
+        .filter((candidate) => candidate.kind === kind);
+    if (kind === "video" && context.bvid) {
+        candidates = [{
+            kind: "video",
+            bvid: context.bvid,
+            title: context.title,
+            direct: true
+        }];
+    }
+    const ranked = rankCandidates(context, candidates);
+    const detailed = await Promise.all(ranked.map(async (candidate) => {
+        try {
+            return await fetchCandidateDetails(candidate, isStale) || candidate;
+        } catch (e) {
+            console.log(TAG + " candidate detail failed: " + e);
+            return candidate;
+        }
+    }));
+    if (isStale()) {
+        return;
+    }
+
+    const ordered = rankCandidates(context, detailed);
+    const decision = chooseAutoTarget(context, ordered);
+    const result = {
+        context: context,
+        generation: generation,
+        kind: kind,
+        candidates: ordered,
+        decision: decision
+    };
+    sidebar.postMessage("suggestions", result);
+    return result;
 }
 
 function handleFileLoaded(data) {
@@ -628,8 +705,11 @@ function handleFileLoaded(data) {
     fileGeneration += 1;
     invalidateFileLoads();
     const generation = fileGeneration;
+    const recognitionSearchGeneration = searchGeneration;
     sidebar.postMessage("file-context", { context: context, generation: generation });
-    Promise.resolve().then(() => recognizeCurrentFile(context, generation)).catch((e) => {
+    Promise.resolve().then(() => recognizeCurrentFile(
+        context, generation, recognitionSearchGeneration
+    )).catch((e) => {
         if (isCurrentFile(generation)) {
             reportError(e);
         }
@@ -818,68 +898,531 @@ function isCurrentSearch(state) {
         state.fileGeneration === fileGeneration;
 }
 
-async function searchBangumi(keyword, searchState) {
-    keyword = (keyword || "").trim();
-    if (!keyword) {
-        sidebar.postMessage("error", { message: "请输入番剧名称" });
+function stripSearchMarkup(value) {
+    return String(value || "")
+        .replace(/<[^>]*>/g, "")
+        .replace(/&amp;/g, "&")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .trim();
+}
+
+function normalizeSearchKeyword(keyword) {
+    return stripSearchMarkup(keyword).replace(/\s+/g, " ").trim();
+}
+
+function normalizeComparableTitle(value) {
+    return normalizeSearchKeyword(value).toLowerCase().replace(
+        /[\s._\-,:：，。!！?？'"“”‘’·\/\\|()\[\]{}]+/g, ""
+    );
+}
+
+function titleSimilarity(leftTitle, rightTitle) {
+    const left = normalizeComparableTitle(leftTitle);
+    const right = normalizeComparableTitle(rightTitle);
+    if (!left || !right) {
+        return 0;
+    }
+    if (left === right) {
+        return 1;
+    }
+    const shorter = left.length <= right.length ? left : right;
+    const longer = left.length <= right.length ? right : left;
+    if (longer.indexOf(shorter) >= 0) {
+        return 0.75 + 0.2 * shorter.length / longer.length;
+    }
+    let prefix = 0;
+    while (prefix < left.length && prefix < right.length && left[prefix] === right[prefix]) {
+        prefix += 1;
+    }
+    return 0.6 * prefix / Math.max(left.length, right.length);
+}
+
+function sourceKind(kind) {
+    if (kind === "video" || kind === "bangumi") {
+        return kind;
+    }
+    return "unknown";
+}
+
+function searchResultYear(timestamp) {
+    const value = Number(timestamp);
+    if (!Number.isFinite(value) || value <= 0 || typeof Date !== "function") {
+        return null;
+    }
+    return new Date(value * 1000).getFullYear();
+}
+
+function searchCandidateFromResult(kind, result) {
+    if (!result || typeof result !== "object") {
+        return null;
+    }
+    if (kind === "bangumi") {
+        const seasonId = result.season_id || result.seasonId;
+        if (!seasonId) {
+            return null;
+        }
+        const seasonNumber = Number(result.season_number || result.seasonNumber);
+        return {
+            kind: "bangumi",
+            season_id: seasonId,
+            title: stripSearchMarkup(result.title || result.org_title || ""),
+            year: searchResultYear(result.pubtime),
+            seasonNumber: Number.isFinite(seasonNumber) && seasonNumber > 0 ? seasonNumber : null,
+            cover: result.cover || result.pic || null
+        };
+    }
+    const bvid = result.bvid || result.bv_id;
+    if (!bvid) {
+        return null;
+    }
+    return {
+        kind: "video",
+        bvid: bvid,
+        title: stripSearchMarkup(result.title || ""),
+        author: result.author || result.owner && result.owner.name || "",
+        cover: result.pic || result.cover || null,
+        duration: result.duration || null
+    };
+}
+
+function searchCacheKey(kind, keyword) {
+    return sourceKind(kind) + "\u0000" + normalizeSearchKeyword(keyword).toLowerCase();
+}
+
+async function fetchSearchCandidates(kind, keyword, isStale) {
+    const normalizedKind = sourceKind(kind);
+    const normalizedKeyword = normalizeSearchKeyword(keyword);
+    if (normalizedKind === "unknown" || !normalizedKeyword) {
+        return [];
+    }
+    if (isStale && isStale()) {
+        return null;
+    }
+
+    const key = searchCacheKey(normalizedKind, normalizedKeyword);
+    const now = Date.now();
+    const cached = searchCache.get(key);
+    if (cached) {
+        if (cached.expiresAt > now) {
+            return cached.candidates.slice();
+        }
+        searchCache.delete(key);
+    }
+
+    const searchType = normalizedKind === "video" ? "video" : "media_bangumi";
+    const extraHeaders = {
+        "Referer": "https://search.bilibili.com/",
+        "Cookie": "buvid3=" + getBuvid()
+    };
+    const data = await biliApi("/x/web-interface/search/type",
+        { search_type: searchType, keyword: normalizedKeyword },
+        extraHeaders, isStale);
+    if (data === null || (isStale && isStale())) {
+        return null;
+    }
+    const results = Array.isArray(data) ? data : data && Array.isArray(data.result) ? data.result : [];
+    const candidates = results.map((result) => searchCandidateFromResult(normalizedKind, result))
+        .filter((candidate) => candidate !== null);
+    searchCache.set(key, {
+        expiresAt: Date.now() + SEARCH_CACHE_TTL,
+        candidates: candidates
+    });
+    return candidates.slice();
+}
+
+function parseChineseInteger(value) {
+    const digits = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
+    if (!value || !Object.prototype.hasOwnProperty.call(digits, value)) {
+        return null;
+    }
+    return digits[value];
+}
+
+function seasonNumberFromText(value) {
+    const text = String(value || "");
+    let match = /\bS0*(\d{1,2})\b/i.exec(text);
+    if (match) {
+        return Number(match[1]);
+    }
+    match = /\bseason\s*0*(\d{1,2})\b/i.exec(text);
+    if (match) {
+        return Number(match[1]);
+    }
+    match = /第\s*0*(\d{1,2})\s*季/.exec(text);
+    if (match) {
+        return Number(match[1]);
+    }
+    match = /第([一二三四五六七八九十])季/.exec(text);
+    return match ? parseChineseInteger(match[1]) : null;
+}
+
+function candidateSeasonNumber(candidate) {
+    const direct = Number(candidate && (candidate.seasonNumber || candidate.season_number));
+    if (Number.isFinite(direct) && direct > 0) {
+        return direct;
+    }
+    return seasonNumberFromText(candidate && (candidate.title || candidate.detailTitle));
+}
+
+function candidateEpisodes(candidate) {
+    if (candidate && Array.isArray(candidate.episodes)) {
+        return candidate.episodes;
+    }
+    const detail = candidate && (candidate.detail || candidate.details);
+    return detail && Array.isArray(detail.episodes) ? detail.episodes : [];
+}
+
+function candidatePages(candidate) {
+    if (candidate && Array.isArray(candidate.pages)) {
+        return candidate.pages;
+    }
+    const detail = candidate && (candidate.detail || candidate.details);
+    return detail && Array.isArray(detail.pages) ? detail.pages : [];
+}
+
+function candidateHasEpisode(candidate, episodeNumber) {
+    const direct = numberedValue(candidate && (candidate.episodeNumber || candidate.episode_number));
+    if (direct === Number(episodeNumber)) {
+        return true;
+    }
+    return candidateEpisodes(candidate).some((episode) =>
+        episodeNumberOf(episode) === Number(episodeNumber));
+}
+
+function candidateHasPart(candidate, partNumber) {
+    const direct = numberedValue(candidate && (candidate.partNumber || candidate.part_number));
+    if (direct === Number(partNumber)) {
+        return true;
+    }
+    return candidatePages(candidate).some((page) => pageNumberOf(page) === Number(partNumber));
+}
+
+function numberedValue(value) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+        return value;
+    }
+    const text = String(value || "").trim();
+    if (/^\d+$/.test(text)) {
+        return Number(text);
+    }
+    const match = /(?:第\s*)?0*(\d+)\s*(?:集|话|話|回|P)?$/i.exec(text);
+    return match ? Number(match[1]) : null;
+}
+
+function episodeNumberOf(episode) {
+    if (!episode) {
+        return null;
+    }
+    for (const value of [episode.episodeNumber, episode.episode_number,
+        episode.page, episode.title]) {
+        const number = numberedValue(value);
+        if (number !== null) {
+            return number;
+        }
+    }
+    return null;
+}
+
+function pageNumberOf(page) {
+    if (!page) {
+        return null;
+    }
+    for (const value of [page.page, page.partNumber, page.part_number, page.title]) {
+        const number = numberedValue(value);
+        if (number !== null) {
+            return number;
+        }
+    }
+    return null;
+}
+
+function rankCandidates(context, candidates) {
+    const source = Array.isArray(candidates) ? candidates : [];
+    const title = context && context.title;
+    return source.map((candidate, index) => ({
+        candidate: candidate,
+        index: index,
+        titleScore: titleSimilarity(title, candidate && (candidate.title || candidate.detailTitle)),
+        hintScore: (context && context.seasonNumber !== null && context.seasonNumber !== undefined &&
+            candidateSeasonNumber(candidate) === Number(context.seasonNumber) ? 4 : 0) +
+            (context && context.episodeNumber !== null && context.episodeNumber !== undefined &&
+            candidateHasEpisode(candidate, context.episodeNumber) ? 2 : 0) +
+            (context && context.partNumber !== null && context.partNumber !== undefined &&
+            candidateHasPart(candidate, context.partNumber) ? 1 : 0)
+    })).sort((left, right) => {
+        if (right.titleScore !== left.titleScore) {
+            return right.titleScore - left.titleScore;
+        }
+        if (right.hintScore !== left.hintScore) {
+            return right.hintScore - left.hintScore;
+        }
+        return left.index - right.index;
+    }).slice(0, 3).map((entry) => entry.candidate);
+}
+
+function normalizeCandidateEpisode(episode) {
+    return {
+        page: episode && (episode.title || episode.page || ""),
+        part: episode && (episode.long_title || episode.part || ""),
+        cid: episode && episode.cid,
+        ep: episode && (episode.id !== undefined ? episode.id : episode.ep_id)
+    };
+}
+
+function normalizeCandidatePage(page) {
+    return {
+        page: page && page.page,
+        part: page && (page.part || ""),
+        cid: page && page.cid
+    };
+}
+
+async function fetchCandidateDetails(candidate, isStale) {
+    if (!candidate || (isStale && isStale())) {
+        return null;
+    }
+    let result;
+    if (candidate.kind === "bangumi") {
+        result = await biliApi("/pgc/view/web/season", { season_id: candidate.season_id }, null, isStale);
+        if (result === null || (isStale && isStale())) {
+            return null;
+        }
+        const episodes = (Array.isArray(result.episodes) ? result.episodes : []).slice();
+        (Array.isArray(result.section) ? result.section : []).forEach((section) => {
+            if (section && Array.isArray(section.episodes)) {
+                episodes.push(...section.episodes);
+            }
+        });
+        return Object.assign({}, candidate, {
+            detailTitle: stripSearchMarkup(result.title || candidate.title),
+            episodes: episodes.map(normalizeCandidateEpisode)
+        });
+    }
+    result = await biliApi("/x/web-interface/view", { bvid: candidate.bvid }, null, isStale);
+    if (result === null || (isStale && isStale())) {
+        return null;
+    }
+    return Object.assign({}, candidate, {
+        detailTitle: stripSearchMarkup(result.title || candidate.title),
+        pages: (Array.isArray(result.pages) ? result.pages : []).map(normalizeCandidatePage)
+    });
+}
+
+function isHighConfidenceCandidate(context, candidate) {
+    if (context && context.bvid && candidate && candidate.bvid === context.bvid) {
+        return true;
+    }
+    return titleSimilarity(context && context.title,
+        candidate && (candidate.title || candidate.detailTitle)) >= 0.9;
+}
+
+function recommendation(kind, candidates, reason) {
+    return { decision: "recommend", kind: kind, candidates: candidates, reason: reason };
+}
+
+function resolveCandidateTarget(context, candidate) {
+    const kind = context && context.kindHint;
+    if (kind === "bangumi") {
+        const episodeValue = context.episodeNumber;
+        if (episodeValue === null || episodeValue === undefined) {
+            return null;
+        }
+        const episodeNumber = Number(episodeValue);
+        if (!Number.isFinite(episodeNumber)) {
+            return null;
+        }
+        const matches = candidateEpisodes(candidate)
+            .map((episode, index) => ({ episode: episode, index: index }))
+            .filter((entry) => episodeNumberOf(entry.episode) === episodeNumber &&
+                entry.episode.cid);
+        return matches.length === 1 ? { partIndex: matches[0].index } : null;
+    }
+
+    if (kind !== "video") {
+        return null;
+    }
+    const pages = candidatePages(candidate);
+    if (!pages.length) {
+        return null;
+    }
+    const partValue = context.partNumber;
+    if (partValue === null || partValue === undefined) {
+        return pages.length === 1 ? { partIndex: 0 } : null;
+    }
+    const partNumber = Number(partValue);
+    if (!Number.isFinite(partNumber)) {
+        return null;
+    }
+    const matches = pages.map((page, index) => ({ page: page, index: index }))
+        .filter((entry) => pageNumberOf(entry.page) === partNumber && entry.page.cid);
+    return matches.length === 1 ? { partIndex: matches[0].index } : null;
+}
+
+function chooseAutoTarget(context, candidates) {
+    const kind = context && (context.kindHint === "video" || context.kindHint === "bangumi")
+        ? context.kindHint : "unknown";
+    const ranked = Array.isArray(candidates) ? candidates.filter((candidate) =>
+        !candidate.kind || candidate.kind === kind) : [];
+    if (kind === "unknown") {
+        return { decision: "none", kind: kind, reason: "无法确定弹幕源类型" };
+    }
+    if (!ranked.length) {
+        return { decision: "none", kind: kind, reason: "没有找到候选来源" };
+    }
+    const seasonEligible = kind === "bangumi" && context.seasonNumber !== null &&
+        context.seasonNumber !== undefined
+        ? ranked.filter((candidate) => {
+            const candidateSeason = candidateSeasonNumber(candidate);
+            // media_bangumi search results usually omit numeric season metadata;
+            // only reject an explicit contradictory season hint.
+            return candidateSeason === null || candidateSeason === Number(context.seasonNumber);
+        })
+        : ranked;
+    const strong = seasonEligible.filter((candidate) => isHighConfidenceCandidate(context, candidate));
+    const targetable = strong.map((candidate) => ({
+        candidate: candidate,
+        target: resolveCandidateTarget(context, candidate)
+    })).filter((entry) => entry.target !== null);
+    if (targetable.length !== 1) {
+        return recommendation(kind, ranked, targetable.length > 1
+            ? "候选来源存在歧义"
+            : (strong.length ? "无法唯一匹配目标分集" : "没有唯一高置信候选"));
+    }
+
+    const candidate = targetable[0].candidate;
+    return {
+        decision: "load",
+        kind: kind,
+        candidate: candidate,
+        partIndex: targetable[0].target.partIndex,
+        confidence: "high"
+    };
+}
+
+function requestSearchCandidates(kind, keyword, generation) {
+    const normalizedKind = sourceKind(kind);
+    const normalizedKeyword = normalizeSearchKeyword(keyword);
+    const key = searchCacheKey(normalizedKind, normalizedKeyword);
+    const existing = pendingSearches.get(key);
+    if (existing && existing.fileGeneration === fileGeneration &&
+        existing.generation === searchGeneration &&
+        (generation === undefined || existing.generation === generation)) {
+        return { promise: existing.promise, state: existing };
+    }
+    if (generation !== undefined && generation !== searchGeneration) {
+        return {
+            promise: Promise.resolve(null),
+            state: null
+        };
+    }
+
+    const requestGeneration = generation === undefined ? searchGeneration + 1 : generation;
+    if (generation === undefined) {
+        searchGeneration = requestGeneration;
+        pendingSearches.clear();
+    }
+    const state = {
+        kind: normalizedKind,
+        fileGeneration: fileGeneration,
+        generation: requestGeneration
+    };
+    const promise = fetchSearchCandidates(normalizedKind, normalizedKeyword,
+        () => !isCurrentSearch(state));
+    const pending = Object.assign({}, state, {
+        promise: promise,
+        manualPromise: null,
+        settled: false
+    });
+    pendingSearches.set(key, pending);
+    const clearPendingSearch = () => {
+        pending.settled = true;
+        if (pendingSearches.get(key) === pending && !pending.manualPromise) {
+            pendingSearches.delete(key);
+        }
+    };
+    promise.then(clearPendingSearch, clearPendingSearch);
+    return { promise: promise, state: state };
+}
+
+async function searchSource(kind, keyword) {
+    const normalizedKind = sourceKind(kind);
+    const normalizedKeyword = normalizeSearchKeyword(keyword);
+    if (!normalizedKeyword) {
+        sidebar.postMessage("error", {
+            message: normalizedKind === "bangumi" ? "请输入番剧名称" : "请输入视频名称"
+        });
         return;
     }
-    sidebar.postMessage("status", { text: "正在搜索「" + keyword + "」…" });
+    sidebar.postMessage("status", { text: "正在搜索「" + normalizedKeyword + "」…" });
+    let request = null;
     try {
-        const data = await biliApi("/x/web-interface/search/type",
-            { search_type: "media_bangumi", keyword: keyword },
-            {
-                "Referer": "https://search.bilibili.com/",
-                "Cookie": "buvid3=" + getBuvid()
-            },
-            () => !isCurrentSearch(searchState));
-        if (data === null || !isCurrentSearch(searchState)) {
+        request = requestSearchCandidates(normalizedKind, normalizedKeyword);
+        const candidates = await request.promise;
+        if (candidates === null || !isCurrentSearch(request.state)) {
             return;
         }
-        const seasons = (data.result || []).map((r) => ({
-            season_id: r.season_id,
-            title: String(r.title || "").replace(/<[^>]*>/g, ""),
-            year: r.pubtime ? new Date(r.pubtime * 1000).getFullYear() : null
-        })).filter((s) => s.season_id);
-        if (!seasons.length) {
-            sidebar.postMessage("error", { message: "没有搜到相关番剧，换个关键词试试" });
+        if (!candidates.length) {
+            sidebar.postMessage("error", { message: "没有搜到相关结果，换个关键词试试" });
             return;
         }
-        console.log(TAG + " search: " + seasons.length + " seasons");
-        sidebar.postMessage("seasons", { seasons: seasons });
-        sidebar.postMessage("status", { text: "搜到 " + seasons.length + " 部番剧，请选择" });
+        if (normalizedKind === "bangumi") {
+            console.log(TAG + " search: " + candidates.length + " seasons");
+            sidebar.postMessage("seasons", {
+                seasons: candidates.map((candidate) => ({
+                    season_id: candidate.season_id,
+                    title: candidate.title,
+                    year: candidate.year
+                }))
+            });
+            sidebar.postMessage("status", { text: "搜到 " + candidates.length + " 部番剧，请选择" });
+        } else {
+            sidebar.postMessage("candidates", { kind: normalizedKind, candidates: candidates });
+            sidebar.postMessage("status", { text: "搜到 " + candidates.length + " 个视频，请选择" });
+        }
     } catch (e) {
-        if (isCurrentSearch(searchState)) {
+        if (!request || isCurrentSearch(request.state)) {
             reportError(e);
         }
     }
 }
 
-function requestBangumiSearch(keyword) {
-    const normalizedKeyword = (keyword || "").trim();
-    if (pendingSearch && pendingSearch.keyword === normalizedKeyword &&
-        pendingSearch.fileGeneration === fileGeneration &&
-        pendingSearch.generation === searchGeneration) {
-        return pendingSearch.promise;
+async function searchBangumi(keyword) {
+    return searchSource("bangumi", keyword);
+}
+
+function requestSourceSearch(kind, keyword) {
+    const normalizedKind = sourceKind(kind);
+    const normalizedKeyword = normalizeSearchKeyword(keyword);
+    const key = searchCacheKey(normalizedKind, normalizedKeyword);
+    const existing = pendingSearches.get(key);
+    if (existing && existing.fileGeneration === fileGeneration &&
+        existing.generation === searchGeneration && existing.manualPromise) {
+        return existing.manualPromise;
     }
-    const searchState = {
-        fileGeneration: fileGeneration,
-        generation: ++searchGeneration
-    };
-    const promise = searchBangumi(normalizedKeyword, searchState);
-    pendingSearch = {
-        keyword: normalizedKeyword,
-        promise: promise,
-        fileGeneration: searchState.fileGeneration,
-        generation: searchState.generation
-    };
-    const clearPendingSearch = () => {
-        if (pendingSearch && pendingSearch.promise === promise) {
-            pendingSearch = null;
-        }
-    };
-    promise.then(clearPendingSearch, clearPendingSearch);
+
+    const promise = searchSource(normalizedKind, normalizedKeyword);
+    const pending = pendingSearches.get(key);
+    if (pending && pending.fileGeneration === fileGeneration &&
+        pending.generation === searchGeneration) {
+        pending.manualPromise = promise;
+        const clearManualPromise = () => {
+            if (pending.manualPromise === promise) {
+                pending.manualPromise = null;
+                if (pending.settled && pendingSearches.get(key) === pending) {
+                    pendingSearches.delete(key);
+                }
+            }
+        };
+        promise.then(clearManualPromise, clearManualPromise);
+    }
     return promise;
+}
+
+function requestBangumiSearch(keyword) {
+    return requestSourceSearch("bangumi", keyword);
 }
 
 async function loadSeasonById(seasonId, loadState, epId) {
@@ -980,7 +1523,7 @@ function clearCurrentStream() {
 
 function invalidateFileLoads() {
     searchGeneration += 1;
-    pendingSearch = null;
+    pendingSearches.clear();
     video = null;
     clearCurrentStream();
 }
@@ -988,7 +1531,7 @@ function invalidateFileLoads() {
 function invalidateCurrentLoad() {
     loadToken += 1;
     searchGeneration += 1;
-    pendingSearch = null;
+    pendingSearches.clear();
     clearCurrentStream();
     return currentLoadState();
 }

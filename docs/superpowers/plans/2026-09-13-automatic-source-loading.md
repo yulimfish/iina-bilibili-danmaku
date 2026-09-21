@@ -17,9 +17,18 @@
 ## 状态更新（2026-09-21 · Task 2）
 
 - 已分离三代状态：`fileGeneration` 使换片前的详情/XML请求失效，`searchGeneration` 只使搜索结果失效，`loadToken` 只由真正采用来源的操作递增并清理当前流。
-- `iina.file-loaded` 现在同步生成并发布 `file-context`，重复 identity 去重，再通过未等待的 `recognizeCurrentFile(context, generation)` 异步衔接后续识别；`mpv.end-file` 会递增文件代际并取消旧工作。
+- `iina.file-loaded` 现在同步生成并发布 `file-context`，重复 identity 去重，再通过未等待的 `recognizeCurrentFile(context, generation, recognitionSearchGeneration)` 异步衔接后续识别；`mpv.end-file` 会递增文件代际并取消旧工作。
 - 后台/手动搜索不再清空当前弹幕；新的手动来源加载会立即使未完成搜索失效。候选获取逻辑留在 Task 3。
 - 验证通过：`node --test tests/main-stream.test.js` 51/51、`node --check main.js`、`git diff --check`。
+
+## 状态更新（2026-09-21 · Task 3）
+
+- 已将剧集与视频搜索统一为无 UI 副作用的 `fetchSearchCandidates(kind, keyword, isStale)`；手动搜索和文件识别共用同一 API 适配层，pending key 按来源类型与规范化关键词隔离，文件识别同一批次会并行查询两种来源。
+- 已按规范化标题相似度、季数、集号与分P提示排序，先取前 3 个候选详情，再用详情中的真实集/P信息重排；详情错误不会进入搜索缓存，搜索结果缓存 TTL 为 10 分钟。
+- `chooseAutoTarget(context, candidates)` 只在唯一高置信且集/P可唯一定位时返回 `load`，多P缺少明确分P或存在歧义时返回 `recommend`，无来源类型/结果时返回 `none`；B站搜索缺少数字季数时，仅在没有显式冲突且标题/集号唯一时继续判断。
+- `recognizeCurrentFile()` 现在跳过空闲/网络资源/低置信文件，异步发布 `suggestions` 决策，不提前加载弹幕；手动来源加载会使进行中的自动识别失效，自动采用来源留给 Task 4。
+- 搜索请求统一携带 `buvid3`，覆盖 B站对剧集与视频 `search/type` 的风控要求。
+- 验证通过：`node --test tests/main-stream.test.js` 70/70、`node --test tests/*.test.js` 133/133、`node --check main.js`、`git diff --check`。
 
 ## 全局约束
 
@@ -109,10 +118,10 @@ GET /pgc/view/web/season?season_id=<id>
 GET /x/web-interface/view?bvid=<bvid>
 ```
 
-- [ ] 将现有 `searchBangumi()` 的结果转换提取为无 UI 副作用的 `fetchSearchCandidates(kind, keyword, isStale)`；手动搜索与自动识别复用它。
-- [ ] pending search key 使用 `kind + normalizedKeyword`，避免同关键词的剧集与视频请求错误合并。
-- [ ] 新增 `rankCandidates(context, candidates)`：规范化标题相似度优先，其次匹配季数、集号或分 P；只取前 1-3 个候选请求详情。
-- [ ] 新增 `chooseAutoTarget(context, candidates)`，只返回以下之一：
+- [x] 将现有 `searchBangumi()` 的结果转换提取为无 UI 副作用的 `fetchSearchCandidates(kind, keyword, isStale)`；手动搜索与自动识别复用它。
+- [x] pending search key 使用 `kind + normalizedKeyword`，避免同关键词的剧集与视频请求错误合并。
+- [x] 新增 `rankCandidates(context, candidates)`：规范化标题相似度优先，其次匹配季数、集号或分 P；只取前 1-3 个候选请求详情。
+- [x] 新增 `chooseAutoTarget(context, candidates)`，只返回以下之一：
 
 ```js
 { decision: "load", kind, candidate, partIndex, confidence: "high" }
@@ -120,9 +129,9 @@ GET /x/web-interface/view?bvid=<bvid>
 { decision: "none", kind, reason }
 ```
 
-- [ ] 多 P 视频只有文件名明确 P 且详情存在该 P 时可自动加载；无 P 提示时即使标题唯一也返回推荐。剧集必须 season 与 episode 都唯一匹配。
-- [ ] 增加内存搜索缓存，key 为 `kind + normalizedKeyword`、TTL 10 分钟；不缓存详情错误和弹幕 XML。
-- [ ] 运行 `node --test tests/main-stream.test.js`，预期剧集、视频、多候选、多 P 和缓存测试全部通过。
+- [x] 多 P 视频只有文件名明确 P 且详情存在该 P 时可自动加载；无 P 提示时即使标题唯一也返回推荐。剧集必须 season 与 episode 都唯一匹配。
+- [x] 增加内存搜索缓存，key 为 `kind + normalizedKeyword`、TTL 10 分钟；不缓存详情错误和弹幕 XML。
+- [x] 运行 `node --test tests/main-stream.test.js`，预期剧集、视频、多候选、多 P 和缓存测试全部通过。
 
 ### Task 4：增加独立自动加载偏好与 HUD
 
