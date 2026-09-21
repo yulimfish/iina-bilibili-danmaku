@@ -135,9 +135,9 @@ GET /x/web-interface/view?bvid=<bvid>
 
 ### Task 4：增加独立自动加载偏好与 HUD
 
-- [ ] 在 `DEFAULT_SETTINGS` 增加 `autoLoadBangumi: false`、`autoLoadVideo: false`，沿用 settings 的 preferences 持久化。
-- [ ] 添加行为测试：只开剧集时高置信剧集加载、视频推荐；只开视频时反向；两个都关时仅推荐；两个都开时仍按 `kindHint` 只走一个主频道。
-- [ ] 自动决策采用来源时构造不可变流元数据：
+- [x] 在 `DEFAULT_SETTINGS` 增加 `autoLoadBangumi: false`、`autoLoadVideo: false`，沿用 settings 的 preferences 持久化。
+- [x] 添加行为测试：只开剧集时高置信剧集加载、视频推荐；只开视频时反向；两个都关时仅推荐；两个都开时仍按 `kindHint` 只走一个主频道。
+- [x] 自动决策采用来源时构造不可变流元数据：
 
 ```js
 {
@@ -148,9 +148,9 @@ GET /x/web-interface/view?bvid=<bvid>
 }
 ```
 
-- [ ] “正在自动匹配”和“正在自动加载”只更新 sidebar，不调用 HUD；`core.osd()` 仅在同一 `fileGeneration`、同一 streamId 的 `complete` 阶段显示“已自动加载”，或在失败、存在歧义且确实需要用户操作时给出一次简短提示。
-- [ ] 自动流程错误不得暂停播放或弹阻塞对话框；sidebar 显示可重试错误，HUD 仅给简短状态。
-- [ ] 运行 `node --test tests/main-stream.test.js`，预期两个开关、HUD 时机和 stale stream 测试全部通过。
+- [x] “正在自动匹配”和“正在自动加载”只更新 sidebar，不调用 HUD；`core.osd()` 仅在同一 `fileGeneration`、同一 streamId 的 `complete` 阶段显示“已自动加载”，或在失败、存在歧义且确实需要用户操作时给出一次简短提示。
+- [x] 自动流程错误不得暂停播放或弹阻塞对话框；sidebar 显示可重试错误，HUD 仅给简短状态。
+- [x] 运行 `node --test tests/main-stream.test.js`，预期两个开关、HUD 时机和 stale stream 测试全部通过。
 
 ### Task 5：重组弹幕源面板并展示推荐
 

@@ -1545,6 +1545,185 @@ test("persists a settings patch and returns the merged settings to the sidebar",
     assert.equal(settings.at(-1).data.settings.fontSize, 32);
 });
 
+test("persists independent automatic loading preferences", () => {
+    const fixture = loadMainFixture();
+    const initial = currentSettings(fixture);
+
+    assert.equal(initial.autoLoadBangumi, false);
+    assert.equal(initial.autoLoadVideo, false);
+    fixture.sidebarHandlers["update-settings"]({ patch: {
+        autoLoadBangumi: true, autoLoadVideo: false
+    } });
+
+    assert.equal(fixture.savedSettings.autoLoadBangumi, true);
+    assert.equal(fixture.savedSettings.autoLoadVideo, false);
+    assert.equal(currentSettings(fixture).autoLoadBangumi, true);
+});
+
+test("automatically loads a unique bangumi target only after stream completion", async () => {
+    const fixture = loadMainFixture({
+        settings: { autoLoadBangumi: true },
+        httpGet(url, request) {
+            if (url.includes("/x/web-interface/search/type")) {
+                if (request.params.search_type === "video") {
+                    return sourceSearchResponse([]);
+                }
+                return sourceSearchResponse([{ season_id: 1, title: "Show", pubtime: 0 }]);
+            }
+            if (url.includes("/pgc/view/web/season")) {
+                return seasonDetailResponse("Show", [{ id: 3, cid: 103, title: "3" }]);
+            }
+            if (url.includes("/x/v1/dm/list.so")) {
+                return { statusCode: 200, text: "<i></i>" };
+            }
+            return undefined;
+        }
+    });
+
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Show.S02E03.mkv");
+    await wait(20);
+
+    const stream = fixture.overlayMessages.find((message) => message.name === "stream-start");
+    assert.ok(stream, "automatic decision should adopt the selected source");
+    assert.deepEqual(JSON.parse(JSON.stringify(stream.data.metadata)), {
+        origin: "auto", fileGeneration: 1, title: "Show", partLabel: "第3集"
+    });
+    assert.deepEqual(fixture.osdMessages, []);
+
+    fixture.overlayHandlers["stream-state"]({
+        streamId: stream.data.streamId, phase: "complete", parsed: 1, accepted: 1
+    });
+    assert.deepEqual(fixture.osdMessages, ["已自动加载「Show」第3集"]);
+});
+
+test("keeps automatic loading scoped to the filename kind preference", async () => {
+    const createFixture = (settings, filename) => loadMainFixture({
+        settings: settings,
+        httpGet(url, request) {
+            if (url.includes("/x/web-interface/search/type")) {
+                if (request.params.search_type === "media_bangumi") {
+                    return sourceSearchResponse([{ season_id: 1, title: "Show", pubtime: 0 }]);
+                }
+                return sourceSearchResponse([{ bvid: "BV1xx411c7mD", title: "Show" }]);
+            }
+            if (url.includes("/pgc/view/web/season")) {
+                return seasonDetailResponse("Show", [{ id: 3, cid: 103, title: "3" }]);
+            }
+            if (url.includes("/x/web-interface/view")) {
+                return {
+                    statusCode: 200,
+                    text: JSON.stringify({ code: 0, data: {
+                        title: "Show", pages: [{ page: 1, part: "", cid: 301 }]
+                    } })
+                };
+            }
+            if (url.includes("/x/v1/dm/list.so")) {
+                return { statusCode: 200, text: "<i></i>" };
+            }
+            return undefined;
+        }
+    });
+
+    const bangumiOnly = createFixture(
+        { autoLoadBangumi: true, autoLoadVideo: false }, "file:///tmp/Show.S02E03.mkv");
+    bangumiOnly.eventHandlers["iina.file-loaded"]("file:///tmp/Show.S02E03.mkv");
+    await wait(15);
+    assert.equal(bangumiOnly.overlayMessages.filter((message) => message.name === "stream-start").length, 1);
+
+    const videoOnly = createFixture(
+        { autoLoadBangumi: false, autoLoadVideo: true }, "file:///tmp/Show-P1.mp4");
+    videoOnly.eventHandlers["iina.file-loaded"]("file:///tmp/Show-P1.mp4");
+    await wait(15);
+    assert.equal(videoOnly.overlayMessages.filter((message) => message.name === "stream-start").length, 1);
+
+    const bothEnabled = createFixture(
+        { autoLoadBangumi: true, autoLoadVideo: true }, "file:///tmp/Show.S02E03.mkv");
+    bothEnabled.eventHandlers["iina.file-loaded"]("file:///tmp/Show.S02E03.mkv");
+    await wait(15);
+    assert.equal(bothEnabled.overlayMessages.filter((message) => message.name === "stream-start").length, 1);
+
+    const disabled = createFixture(
+        { autoLoadBangumi: false, autoLoadVideo: false }, "file:///tmp/Show.S02E03.mkv");
+    disabled.eventHandlers["iina.file-loaded"]("file:///tmp/Show.S02E03.mkv");
+    await wait(15);
+    assert.equal(disabled.overlayMessages.filter((message) => message.name === "stream-start").length, 0);
+});
+
+test("does not announce an automatic stream after its file generation is stale", async () => {
+    const fixture = loadMainFixture({
+        settings: { autoLoadBangumi: true },
+        httpGet(url, request) {
+            if (url.includes("/x/web-interface/search/type")) {
+                return request.params.search_type === "video"
+                    ? sourceSearchResponse([])
+                    : sourceSearchResponse([{ season_id: 1, title: "Show", pubtime: 0 }]);
+            }
+            if (url.includes("/pgc/view/web/season")) {
+                return seasonDetailResponse("Show", [{ id: 3, cid: 103, title: "3" }]);
+            }
+            if (url.includes("/x/v1/dm/list.so")) {
+                return { statusCode: 200, text: "<i></i>" };
+            }
+            return undefined;
+        }
+    });
+
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Show.S02E03.mkv");
+    await wait(15);
+    const stream = fixture.overlayMessages.find((message) => message.name === "stream-start");
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Other.S02E03.mkv");
+    fixture.overlayHandlers["stream-state"]({
+        streamId: stream.data.streamId, phase: "complete", parsed: 1, accepted: 1
+    });
+
+    assert.deepEqual(fixture.osdMessages, []);
+});
+
+test("shows one short HUD prompt when automatic matching is ambiguous", async () => {
+    const fixture = loadMainFixture({
+        settings: { autoLoadBangumi: true },
+        httpGet(url, request) {
+            if (url.includes("/x/web-interface/search/type")) {
+                return request.params.search_type === "video"
+                    ? sourceSearchResponse([])
+                    : sourceSearchResponse([
+                        { season_id: 1, title: "Show", pubtime: 0 },
+                        { season_id: 2, title: "Show", pubtime: 0 }
+                    ]);
+            }
+            if (url.includes("/pgc/view/web/season")) {
+                return seasonDetailResponse("Show", [{ id: 3, cid: 103, title: "3" }]);
+            }
+            return undefined;
+        }
+    });
+
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Show.S02E03.mkv");
+    await wait(15);
+
+    assert.equal(fixture.overlayMessages.filter((message) => message.name === "stream-start").length, 0);
+    assert.deepEqual(fixture.osdMessages, ["自动匹配存在歧义，请在侧栏选择"]);
+});
+
+test("shows one retry prompt when automatic matching fails without pausing playback", async () => {
+    const fixture = loadMainFixture({
+        settings: { autoLoadBangumi: true },
+        httpGet(url) {
+            if (url.includes("/x/web-interface/search/type")) {
+                throw new Error("search unavailable");
+            }
+            return undefined;
+        }
+    });
+
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Show.S02E03.mkv");
+    await wait(15);
+
+    assert.equal(fixture.core.status.paused, false);
+    assert.deepEqual(fixture.osdMessages, ["自动匹配失败，请在侧栏重试"]);
+    assert.equal(fixture.sidebarMessages.at(-1).name, "error");
+});
+
 function currentSettings(fixture) {
     fixture.sidebarHandlers["sidebar-ready"]({});
     const messages = fixture.sidebarMessages.filter((message) => message.name === "settings");
@@ -1584,7 +1763,8 @@ test("normalizes saved settings types, ranges and unknown keys", () => {
     assert.deepEqual(settings, {
         enabled: true, showTop: false, showBottom: true, fontSize: 36,
         opacity: 0, speed: 1200, offset: -30, fontFamily: "toString",
-        strokeColor: "#000000", strokeWidth: 3
+        strokeColor: "#000000", strokeWidth: 3,
+        autoLoadBangumi: false, autoLoadVideo: false
     });
     assert.ok(fixture.savedSettings, "stale stored values trigger migration write-back");
     assert.equal(fixture.savedSettings.fontSize, 36);
@@ -1686,7 +1866,8 @@ test("migrates full default settings when nothing was stored yet", () => {
     assert.deepEqual(JSON.parse(JSON.stringify(fixture.savedSettings)), {
         enabled: true, showTop: true, showBottom: true, fontSize: 25,
         fontFamily: "system", strokeWidth: 1, strokeColor: "#000000",
-        opacity: 100, speed: 680, offset: 0
+        opacity: 100, speed: 680, offset: 0,
+        autoLoadBangumi: false, autoLoadVideo: false
     });
     assert.equal(fixture.preferenceSyncCalls, 1);
 });
@@ -1695,7 +1876,8 @@ test("skips the migration save when stored settings are complete and valid", () 
     const full = {
         enabled: true, showTop: true, showBottom: true,
         fontSize: 25, fontFamily: "PingFang SC", strokeWidth: 1.5,
-        strokeColor: "#123abc", opacity: 80, speed: 680, offset: 0
+        strokeColor: "#123abc", opacity: 80, speed: 680, offset: 0,
+        autoLoadBangumi: false, autoLoadVideo: false
     };
     const fixture = loadMainFixture({ settings: full });
     assert.equal(fixture.savedSettings, null);

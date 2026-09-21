@@ -130,6 +130,8 @@ let overlayMessagesRegistered = false;
 let pendingStream = null; // load arrived before overlay webview was ready
 let nextStreamId = 0;
 let currentStreamId = 0;
+let currentStreamMetadata = null;
+let autoHudNotifiedStreamId = 0;
 let streamPumpGeneration = 0;
 let acknowledgeStreamChunk = null;
 let danmakuActive = false;
@@ -166,7 +168,9 @@ const DEFAULT_SETTINGS = {
     strokeColor: "#000000", // text outline color, #RRGGBB
     opacity: 100, // 0-100
     speed: 680, // CCL scroll baseline; larger = faster
-    offset: 0 // seconds added to playback position
+    offset: 0, // seconds added to playback position
+    autoLoadBangumi: false,
+    autoLoadVideo: false
 };
 
 const FONT_FAMILY_SANITIZER = /^[^;{}()<>\\",'\r\n]+$/;
@@ -627,6 +631,8 @@ async function recognizeCurrentFile(context, generation, recognitionSearchGenera
         return;
     }
 
+    sidebar.postMessage("status", { text: "正在自动匹配…" });
+
     const expectedSearchGeneration = recognitionSearchGeneration === undefined
         ? searchGeneration : recognitionSearchGeneration;
     if (searchGeneration !== expectedSearchGeneration) {
@@ -691,7 +697,63 @@ async function recognizeCurrentFile(context, generation, recognitionSearchGenera
         decision: decision
     };
     sidebar.postMessage("suggestions", result);
+    if (decision.decision === "load" && automaticLoadEnabled(kind)) {
+        await loadAutomaticDecision(context, generation, decision);
+    } else if (automaticLoadEnabled(kind)) {
+        core.osd(decision.decision === "recommend"
+            ? "自动匹配存在歧义，请在侧栏选择"
+            : "自动匹配失败，请在侧栏重试");
+    }
     return result;
+}
+
+function automaticLoadEnabled(kind) {
+    return kind === "bangumi" ? settings.autoLoadBangumi : settings.autoLoadVideo;
+}
+
+function notifyAutomaticStream(streamId, message) {
+    if (!currentStreamMetadata || currentStreamMetadata.origin !== "auto" ||
+        currentStreamMetadata.fileGeneration !== fileGeneration ||
+        streamId !== currentStreamId || autoHudNotifiedStreamId === streamId) {
+        return;
+    }
+    autoHudNotifiedStreamId = streamId;
+    core.osd(message);
+}
+
+function automaticStreamMetadata(context, candidate, partIndex, generation) {
+    const parts = candidate && candidate.kind === "bangumi"
+        ? candidateEpisodes(candidate) : candidatePages(candidate);
+    const target = parts[partIndex] || null;
+    const number = candidate && candidate.kind === "bangumi"
+        ? episodeNumberOf(target) : pageNumberOf(target);
+    const fallbackNumber = partIndex + 1;
+    const partLabel = candidate && candidate.kind === "bangumi"
+        ? "第" + (number === null ? fallbackNumber : number) + "集"
+        : "第 " + (number === null ? fallbackNumber : number) + " P";
+    return Object.freeze({
+        origin: "auto",
+        fileGeneration: generation,
+        title: stripSearchMarkup(candidate && (candidate.detailTitle || candidate.title) ||
+            context.title),
+        partLabel: partLabel
+    });
+}
+
+async function loadAutomaticDecision(context, generation, decision) {
+    if (!isCurrentFile(generation) || !automaticLoadEnabled(decision.kind)) {
+        return;
+    }
+    const candidate = decision.candidate;
+    const metadata = automaticStreamMetadata(context, candidate, decision.partIndex, generation);
+    const loadState = invalidateCurrentLoad();
+    sidebar.postMessage("status", { text: "正在自动加载…" });
+    if (decision.kind === "bangumi") {
+        await loadSeasonById(String(candidate.season_id), loadState, null, metadata,
+            decision.partIndex);
+    } else {
+        await loadBvid(candidate.bvid, loadState, metadata, decision.partIndex);
+    }
 }
 
 function handleFileLoaded(data) {
@@ -712,6 +774,9 @@ function handleFileLoaded(data) {
     )).catch((e) => {
         if (isCurrentFile(generation)) {
             reportError(e);
+            if (automaticLoadEnabled(context.kindHint)) {
+                core.osd("自动匹配失败，请在侧栏重试");
+            }
         }
     });
 }
@@ -792,7 +857,7 @@ function partLabel(index) {
     return "第 " + (index + 1) + " P";
 }
 
-async function loadPart(index, loadState) {
+async function loadPart(index, loadState, streamMetadata) {
     if (!isCurrentLoad(loadState) || !video || index < 0 || index >= video.parts.length) {
         return;
     }
@@ -804,9 +869,11 @@ async function loadPart(index, loadState) {
     if (!isCurrentLoad(loadState)) {
         return; // superseded by a newer load
     }
-    pushToOverlay(xml);
+    pushToOverlay(xml, streamMetadata);
     pushPartsToSidebar();
-    core.osd("已切换到「" + video.title + "」" + label);
+    if (!streamMetadata || streamMetadata.origin !== "auto") {
+        core.osd("已切换到「" + video.title + "」" + label);
+    }
 }
 
 async function loadSource(text) {
@@ -828,7 +895,7 @@ async function loadSource(text) {
     sidebar.postMessage("error", { message: "无法识别：请输入 BV 号/视频链接，或番剧 ep/ss/md 链接" });
 }
 
-async function loadBvid(bvid, loadState) {
+async function loadBvid(bvid, loadState, streamMetadata, preferredPartIndex) {
     sidebar.postMessage("status", { text: "正在获取视频信息…" });
     try {
         const data = await biliApi("/x/web-interface/view", { bvid: bvid });
@@ -844,12 +911,16 @@ async function loadBvid(bvid, loadState) {
         };
         console.log(TAG + " video: " + video.title + " (" + video.parts.length + " parts)");
         pushPartsToSidebar();
-        await loadPart(0, loadState);
+        const index = Number.isInteger(preferredPartIndex) ? preferredPartIndex : 0;
+        await loadPart(index, loadState, streamMetadata);
     } catch (e) {
         if (!isCurrentLoad(loadState)) {
             return;
         }
         reportError(e);
+        if (streamMetadata && streamMetadata.origin === "auto") {
+            core.osd("自动加载失败，请在侧栏重试");
+        }
     }
 }
 
@@ -1425,7 +1496,7 @@ function requestBangumiSearch(keyword) {
     return requestSourceSearch("bangumi", keyword);
 }
 
-async function loadSeasonById(seasonId, loadState, epId) {
+async function loadSeasonById(seasonId, loadState, epId, streamMetadata, preferredPartIndex) {
     sidebar.postMessage("status", { text: "正在获取番剧信息…" });
     try {
         const params = epId ? { ep_id: epId } : { season_id: seasonId };
@@ -1463,10 +1534,14 @@ async function loadSeasonById(seasonId, loadState, epId) {
                 return;
             }
             pushPartsToSidebar();
-            await loadPart(idx, loadState);
+            await loadPart(idx, loadState, streamMetadata);
+        } else if (Number.isInteger(preferredPartIndex) &&
+            preferredPartIndex >= 0 && preferredPartIndex < video.parts.length) {
+            pushPartsToSidebar();
+            await loadPart(preferredPartIndex, loadState, streamMetadata);
         } else if (video.parts.length === 1) {
             pushPartsToSidebar();
-            await loadPart(0, loadState);
+            await loadPart(0, loadState, streamMetadata);
         } else {
             pushPartsToSidebar();
             sidebar.postMessage("status", { text: "「" + video.title + "」共 " + video.parts.length + " 集，请选择分集" });
@@ -1474,6 +1549,9 @@ async function loadSeasonById(seasonId, loadState, epId) {
     } catch (e) {
         if (isCurrentLoad(loadState)) {
             reportError(e);
+            if (streamMetadata && streamMetadata.origin === "auto") {
+                core.osd("自动加载失败，请在侧栏重试");
+            }
         }
     }
 }
@@ -1509,6 +1587,8 @@ function cancelOverlayStream() {
     acknowledgeStreamChunk = null;
     pendingStream = null;
     currentStreamId = 0;
+    currentStreamMetadata = null;
+    autoHudNotifiedStreamId = 0;
     lastPlaybackStateSentAt = 0;
     streamLoading = false;
 }
@@ -1553,6 +1633,7 @@ function startOverlayStream(payload) {
         streamId: payload.streamId,
         title: payload.title,
         settings: payload.settings,
+        metadata: payload.metadata,
         playbackState: playbackStatePayload()
     });
 
@@ -1592,7 +1673,7 @@ function startOverlayStream(payload) {
     pump();
 }
 
-function pushToOverlay(xml) {
+function pushToOverlay(xml, streamMetadata) {
     cancelOverlayStream();
     const payload = {
         streamId: ++nextStreamId,
@@ -1600,7 +1681,11 @@ function pushToOverlay(xml) {
         title: video.title,
         settings: overlaySettings()
     };
+    if (streamMetadata) {
+        payload.metadata = Object.freeze(Object.assign({}, streamMetadata));
+    }
     currentStreamId = payload.streamId;
+    currentStreamMetadata = payload.metadata || null;
     danmakuActive = false;
     streamLoading = true;
     if (!overlayRequested) {
@@ -1666,13 +1751,20 @@ event.on("iina.plugin-overlay-loaded", () => {
                 sidebar.postMessage("status", {
                     text: "已加载「" + video.title + "」" + partLabel(video.index)
                 });
+                if (currentStreamMetadata && currentStreamMetadata.origin === "auto") {
+                    notifyAutomaticStream(data.streamId,
+                        "已自动加载「" + currentStreamMetadata.title + "」" +
+                        currentStreamMetadata.partLabel);
+                }
             } else if (data.phase === "empty") {
                 streamLoading = false;
                 danmakuActive = false;
                 sidebar.postMessage("status", { text: partLabel(video.index) + "暂无弹幕" });
+                notifyAutomaticStream(data.streamId, "自动加载未找到弹幕，请在侧栏重试");
             } else if (data.phase === "error") {
                 streamLoading = false;
                 danmakuActive = false;
+                notifyAutomaticStream(data.streamId, "自动加载失败，请在侧栏重试");
                 cancelOverlayStream();
                 sidebar.postMessage("error", {
                     message: "弹幕渲染失败（" + (data.message || "未知原因") + "）"
@@ -1689,6 +1781,7 @@ event.on("iina.plugin-overlay-loaded", () => {
                 return;
             }
             danmakuActive = false;
+            notifyAutomaticStream(data.streamId, "自动加载失败，请在侧栏重试");
             cancelOverlayStream();
             console.log(TAG + " overlay error: " + (data && data.message));
             sidebar.postMessage("error", { message: "弹幕渲染失败（" + ((data && data.message) || "未知原因") + "）" });
