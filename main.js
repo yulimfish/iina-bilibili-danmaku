@@ -66,6 +66,20 @@ function initializeSidebar() {
     sidebar.onMessage("load-source", (data) => {
         return loadSource(data && data.text);
     });
+    sidebar.onMessage("load-suggestion", (data) => {
+        const candidate = data && data.candidate;
+        const partIndex = data && data.partIndex;
+        if (!candidate || !Number.isInteger(partIndex) || partIndex < 0) {
+            return;
+        }
+        const loadState = invalidateCurrentLoad();
+        if (candidate.kind === "bangumi" && candidate.season_id) {
+            return loadSeasonById(String(candidate.season_id), loadState, null, null, partIndex);
+        }
+        if (candidate.kind === "video" && candidate.bvid) {
+            return loadBvid(candidate.bvid, loadState, null, partIndex);
+        }
+    });
     sidebar.onMessage("search-bangumi", (data) => {
         return requestBangumiSearch(data && data.keyword);
     });

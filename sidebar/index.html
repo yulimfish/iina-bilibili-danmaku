@@ -66,6 +66,19 @@
   }
   .font-opt { padding: 4px 8px; cursor: pointer; color: #ddd; white-space: nowrap; }
   .font-opt:hover { background: #333; }
+  .source-section { margin-bottom: 12px; }
+  .source-section + .source-section { border-top: 1px solid #444; padding-top: 4px; }
+  .source-candidate { padding: 5px 0; color: #ddd; }
+  .source-candidate + .source-candidate { border-top: 1px solid #333; }
+  .source-meta { color: #aaa; margin-bottom: 4px; }
+  .source-actions { display: flex; flex-wrap: wrap; gap: 4px; }
+  .source-actions .source-part,
+  .source-actions .source-load {
+    padding: 4px 7px; border: 0; border-radius: 3px;
+    background: #444; color: #eee; cursor: pointer; font-size: 12px;
+  }
+  .source-actions .source-part:hover,
+  .source-actions .source-load:hover { background: #555; }
 </style>
 </head>
 <body>
@@ -75,17 +88,27 @@
 </div>
 
 <div id="tab-source">
-  <div class="section-title">① 弹幕源</div>
-  <div class="row">
-    <button class="action" id="mode-bv">BV号/链接</button>
-    <button class="action" id="mode-search">搜剧集</button>
-  </div>
-  <input type="text" id="source-input" placeholder="BV号 / 视频链接 / ep·ss·md 链接">
-  <div class="row">
-    <button class="action" id="load-btn">▶ 加载弹幕</button>
-  </div>
-  <div class="status" id="status-line">状态：未加载</div>
-  <div class="list" id="part-list">（空）</div>
+  <section id="auto-source" class="source-section">
+    <div class="section-title">自动识别</div>
+    <div class="status" id="auto-file-context">未加载本地文件</div>
+    <label class="opt"><input type="checkbox" id="set-auto-bangumi"> 自动加载剧集弹幕</label>
+    <label class="opt"><input type="checkbox" id="set-auto-video"> 自动加载视频弹幕</label>
+    <div class="list" id="auto-recommendations">（暂无推荐）</div>
+  </section>
+
+  <section id="manual-source" class="source-section">
+    <div class="section-title">手动搜索</div>
+    <div class="row">
+      <button class="action" id="mode-bangumi">剧集</button>
+      <button class="action" id="mode-video">视频/BV</button>
+    </div>
+    <input type="text" id="manual-source-input" placeholder="番剧名称">
+    <div class="row">
+      <button class="action" id="manual-action-btn">搜索剧集</button>
+    </div>
+    <div class="status" id="status-line">状态：未加载</div>
+    <div class="list" id="manual-source-list">（空）</div>
+  </section>
 </div>
 
 <div id="tab-settings" class="hidden">
@@ -115,7 +138,7 @@
 </div>
 
 <script>
-  // Tab switching is local UI state only; structure untouched.
+  // Tab switching is local UI state only.
   document.getElementById("tabbtn-source").onclick = () => switchTab("source");
   document.getElementById("tabbtn-settings").onclick = () => switchTab("settings");
 
@@ -127,32 +150,38 @@
     document.getElementById("tabbtn-settings").classList.toggle("active", !isSource);
   }
 
-  // M3: BV/link vs bangumi-search input modes.
-  let inputMode = "bv";
-  const sourceInput = document.getElementById("source-input");
-  const loadBtn = document.getElementById("load-btn");
-  const modeBv = document.getElementById("mode-bv");
-  const modeSearch = document.getElementById("mode-search");
+  // M3: manual source search and direct source loading.
+  let inputMode = "bangumi";
+  const sourceInput = document.getElementById("manual-source-input");
+  const loadBtn = document.getElementById("manual-action-btn");
+  const modeBangumi = document.getElementById("mode-bangumi");
+  const modeVideo = document.getElementById("mode-video");
 
   function setInputMode(mode) {
     inputMode = mode;
-    const isSearch = mode === "search";
-    modeBv.classList.toggle("current", !isSearch);
-    modeSearch.classList.toggle("current", isSearch);
-    sourceInput.placeholder = isSearch ? "番剧名称" : "BV号 / 视频链接 / ep·ss·md 链接";
-    loadBtn.textContent = isSearch ? "🔍 搜索" : "▶ 加载弹幕";
+    const isBangumi = mode === "bangumi";
+    modeBangumi.classList.toggle("current", isBangumi);
+    modeVideo.classList.toggle("current", !isBangumi);
+    sourceInput.placeholder = isBangumi ? "番剧名称" : "视频名称 / BV号 / 链接";
+    loadBtn.textContent = isBangumi ? "搜索剧集" : "搜索视频 / 加载";
   }
-  modeBv.onclick = () => setInputMode("bv");
-  modeSearch.onclick = () => setInputMode("search");
-  setInputMode("bv");
+  modeBangumi.onclick = () => setInputMode("bangumi");
+  modeVideo.onclick = () => setInputMode("video");
+  setInputMode("bangumi");
 
-  // M2: BV-source channel wiring.
+  function isDirectSource(text) {
+    return /BV[a-zA-Z0-9]{10}/.test(text || "") || /bilibili\.com\//i.test(text || "");
+  }
+
   loadBtn.onclick = () => {
-    setStatus("正在加载…", false);
-    if (inputMode === "search") {
+    const text = sourceInput.value.trim();
+    setStatus(inputMode === "bangumi" ? "正在搜索…" : "正在搜索或加载…", false);
+    if (inputMode === "bangumi") {
       iina.postMessage("search-bangumi", { keyword: sourceInput.value });
-    } else {
+    } else if (isDirectSource(text)) {
       iina.postMessage("load-source", { text: sourceInput.value });
+    } else {
+      iina.postMessage("search-video", { keyword: sourceInput.value });
     }
   };
 
@@ -162,8 +191,8 @@
     el.classList.toggle("error", !!isError);
   }
 
-  function renderPickList(items, current, onPick) {
-    const list = document.getElementById("part-list");
+  function renderPickList(items, current, onPick, listId) {
+    const list = document.getElementById(listId || "manual-source-list");
     list.textContent = "";
     items.forEach((label, i) => {
       const div = document.createElement("div");
@@ -180,7 +209,7 @@
     }
     setStatus("「" + data.title + "」", false);
     if (!data.parts || !data.parts.length) {
-      document.getElementById("part-list").textContent = data.title || "（空）";
+      document.getElementById("manual-source-list").textContent = data.title || "（空）";
       return;
     }
     // M3: episodes render as 第X集 + long title; BV parts as P1/P2…
@@ -199,6 +228,90 @@
       iina.postMessage("select-season", { season_id: data.seasons[i].season_id }));
   });
 
+  function candidatePartLabel(candidate, part, index) {
+    if (candidate.kind === "bangumi") {
+      return "第" + (part.page || part.title || index + 1) + "集 " + (part.part || "");
+    }
+    return "P" + (part.page || index + 1) + " " + (part.part || "");
+  }
+
+  function postSuggestionLoad(candidate, partIndex) {
+    iina.postMessage("load-suggestion", { candidate: candidate, partIndex: partIndex });
+  }
+
+  function renderCandidate(container, candidate, onlyPartIndex) {
+    const item = document.createElement("div");
+    item.className = "source-candidate";
+    const title = document.createElement("div");
+    title.className = "source-meta";
+    title.textContent = candidate.detailTitle || candidate.title || candidate.bvid || "未命名来源";
+    item.appendChild(title);
+    const actions = document.createElement("div");
+    actions.className = "source-actions";
+    const parts = candidate.kind === "bangumi" ? (candidate.episodes || []) : (candidate.pages || []);
+    const indexes = onlyPartIndex === undefined ? parts.map((_, i) => i) : [onlyPartIndex];
+    if (!indexes.length) {
+      const button = document.createElement("button");
+      button.className = "source-load";
+      button.textContent = "加载";
+      button.onclick = () => postSuggestionLoad(candidate, 0);
+      actions.appendChild(button);
+    } else {
+      indexes.forEach((index) => {
+        const part = parts[index];
+        if (!part) return;
+        const button = document.createElement("button");
+        button.className = onlyPartIndex === undefined && indexes.length > 1
+          ? "source-part" : "source-load";
+        button.textContent = candidatePartLabel(candidate, part, index) +
+          (onlyPartIndex === undefined ? " 加载" : "");
+        button.onclick = () => postSuggestionLoad(candidate, index);
+        actions.appendChild(button);
+      });
+    }
+    item.appendChild(actions);
+    container.appendChild(item);
+  }
+
+  iina.onMessage("file-context", (data) => {
+    const context = data && data.context;
+    const target = document.getElementById("auto-file-context");
+    if (!context) {
+      target.textContent = "未加载本地文件";
+      return;
+    }
+    target.textContent = (context.filename || context.title || "当前文件") +
+      (context.title && context.filename ? " · " + context.title : "");
+  });
+
+  iina.onMessage("suggestions", (data) => {
+    const list = document.getElementById("auto-recommendations");
+    list.textContent = "";
+    const decision = data && data.decision;
+    if (!decision) {
+      list.textContent = "（暂无推荐）";
+      return;
+    }
+    if (decision.decision === "none") {
+      list.textContent = decision.reason || "（暂无推荐）";
+      return;
+    }
+    const candidates = decision.candidate ? [decision.candidate] : (decision.candidates || []);
+    if (!candidates.length) {
+      list.textContent = decision.reason || "（暂无推荐）";
+      return;
+    }
+    candidates.forEach((candidate) => renderCandidate(list, candidate,
+      decision.decision === "load" ? decision.partIndex : undefined));
+  });
+
+  iina.onMessage("candidates", (data) => {
+    const list = document.getElementById("manual-source-list");
+    list.textContent = "";
+    (data && data.candidates || []).forEach((candidate) => renderCandidate(list, candidate));
+    if (!list.children.length) list.textContent = "（暂无候选）";
+  });
+
   iina.onMessage("status", (data) => {
     if (data) {
       setStatus(data.text, false);
@@ -215,6 +328,8 @@
   iina.onMessage("state", (data) => {
     if (data && data.status === "idle") {
       setStatus("未加载", false);
+      document.getElementById("auto-file-context").textContent = "未加载本地文件";
+      document.getElementById("auto-recommendations").textContent = "（暂无推荐）";
     }
   });
 
@@ -223,6 +338,8 @@
     enabled: document.getElementById("set-enabled"),
     showTop: document.getElementById("set-top"),
     showBottom: document.getElementById("set-bottom"),
+    autoLoadBangumi: document.getElementById("set-auto-bangumi"),
+    autoLoadVideo: document.getElementById("set-auto-video"),
     fontSize: document.getElementById("set-fontsize"),
     fontFamily: document.getElementById("set-font-family"),
     strokeWidth: document.getElementById("set-stroke"),
@@ -237,6 +354,8 @@
       enabled: ctl.enabled.checked,
       showTop: ctl.showTop.checked,
       showBottom: ctl.showBottom.checked,
+      autoLoadBangumi: ctl.autoLoadBangumi.checked,
+      autoLoadVideo: ctl.autoLoadVideo.checked,
       fontSize: parseInt(ctl.fontSize.value, 10),
       fontFamily: ctl.fontFamily.value.trim(),
       strokeWidth: parseFloat(ctl.strokeWidth.value),
@@ -280,6 +399,8 @@
     ctl.enabled.checked = s.enabled !== false;
     ctl.showTop.checked = s.showTop !== false;
     ctl.showBottom.checked = s.showBottom !== false;
+    ctl.autoLoadBangumi.checked = s.autoLoadBangumi === true;
+    ctl.autoLoadVideo.checked = s.autoLoadVideo === true;
     ctl.fontSize.value = s.fontSize;
     ctl.fontFamily.value = s.fontFamily;
     ctl.strokeWidth.value = s.strokeWidth;

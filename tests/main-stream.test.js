@@ -1530,6 +1530,23 @@ test("resolves an md link through its season before loading danmaku", async () =
     assert.equal(requestedOid, "700");
 });
 
+test("loads a sidebar recommendation through the main source loader", async () => {
+    const fixture = loadMainFixture({ pageCount: 2 });
+    await fixture.sidebarHandlers["load-suggestion"]({
+        candidate: {
+            kind: "video", bvid: "BV1xx411c7mD", title: "Documentary",
+            pages: [{ page: 1, part: "Intro", cid: 101 }, { page: 2, part: "Main", cid: 102 }]
+        },
+        partIndex: 1
+    });
+    await wait(5);
+
+    const video = fixture.sidebarMessages.filter((message) => message.name === "video").at(-1);
+    assert.equal(video.data.current, 1);
+    assert.equal(fixture.overlayMessages.some((message) => message.name === "stream-start"), true);
+    assert.deepEqual(fixture.osdMessages, ["已切换到「Demo 1」第 2 P"]);
+});
+
 test("persists a settings patch and returns the merged settings to the sidebar", () => {
     const fixture = loadMainFixture({ settings: { opacity: 80 } });
 

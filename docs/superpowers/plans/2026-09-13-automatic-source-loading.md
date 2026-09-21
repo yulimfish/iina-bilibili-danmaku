@@ -175,12 +175,12 @@ GET /x/web-interface/view?bvid=<bvid>
 └─────────────────────────────┘
 ```
 
-- [ ] 新建 `tests/sidebar-source.test.js` fixture，先测试自动上下文、推荐列表、两个独立复选框和手动搜索消息。
-- [ ] 在 `sidebar/index.html` 将 source tab 内部拆成语义上的 `auto-source` 与 `manual-source` 两个 section，保留现有设置 tab。
-- [ ] 自动开关发送 `update-settings` 单键 patch；接收 `file-context` 和 `suggestions` 消息后显示识别内容、候选、集/P与加载按钮。
-- [ ] 手动区同时支持番剧关键词、视频关键词、BV 和 ep/ss/md 链接；视频搜索候选点击后单 P 直接加载，多 P 展开供选择。
-- [ ] sidebar 只渲染主入口提供的数据，不自行请求 B 站 API。
-- [ ] 运行 `node --test tests/sidebar-source.test.js tests/main-stream.test.js`，预期 UI 消息协议测试全部通过。
+- [x] 新建 `tests/sidebar-source.test.js` fixture，先测试自动上下文、推荐列表、两个独立复选框和手动搜索消息。
+- [x] 在 `sidebar/index.html` 将 source tab 内部拆成语义上的 `auto-source` 与 `manual-source` 两个 section，保留现有设置 tab。
+- [x] 自动开关发送 `update-settings` 单键 patch；接收 `file-context` 和 `suggestions` 消息后显示识别内容、候选、集/P与加载按钮。
+- [x] 手动区同时支持番剧关键词、视频关键词、BV 和 ep/ss/md 链接；视频搜索候选点击后单 P 直接加载，多 P 展开供选择。
+- [x] sidebar 只渲染主入口提供的数据，不自行请求 B 站 API。
+- [x] 运行 `node --test tests/sidebar-source.test.js tests/main-stream.test.js`，预期 UI 消息协议测试全部通过。
 
 ### Task 6：完整验证与性能验收
 
