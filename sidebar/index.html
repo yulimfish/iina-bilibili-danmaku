@@ -152,6 +152,7 @@
 
   // M3: manual source search and direct source loading.
   let inputMode = "bangumi";
+  let currentFileGeneration = null;
   const sourceInput = document.getElementById("manual-source-input");
   const loadBtn = document.getElementById("manual-action-btn");
   const modeBangumi = document.getElementById("mode-bangumi");
@@ -225,7 +226,9 @@
     }
     const labels = data.seasons.map((s) => s.title + (s.year ? " (" + s.year + ")" : ""));
     renderPickList(labels, -1, (i) =>
-      iina.postMessage("select-season", { season_id: data.seasons[i].season_id }));
+      iina.postMessage("select-season", {
+        season_id: data.seasons[i].season_id, generation: data.generation
+      }));
   });
 
   function candidatePartLabel(candidate, part, index) {
@@ -235,11 +238,13 @@
     return "P" + (part.page || index + 1) + " " + (part.part || "");
   }
 
-  function postSuggestionLoad(candidate, partIndex) {
-    iina.postMessage("load-suggestion", { candidate: candidate, partIndex: partIndex });
+  function postSuggestionLoad(candidate, partIndex, generation) {
+    iina.postMessage("load-suggestion", {
+      candidate: candidate, partIndex: partIndex, generation: generation
+    });
   }
 
-  function renderCandidate(container, candidate, onlyPartIndex) {
+  function renderCandidate(container, candidate, onlyPartIndex, generation) {
     const item = document.createElement("div");
     item.className = "source-candidate";
     const title = document.createElement("div");
@@ -251,11 +256,9 @@
     const parts = candidate.kind === "bangumi" ? (candidate.episodes || []) : (candidate.pages || []);
     const indexes = onlyPartIndex === undefined ? parts.map((_, i) => i) : [onlyPartIndex];
     if (!indexes.length) {
-      const button = document.createElement("button");
-      button.className = "source-load";
-      button.textContent = "加载";
-      button.onclick = () => postSuggestionLoad(candidate, 0);
-      actions.appendChild(button);
+      const empty = document.createElement("span");
+      empty.textContent = "暂无可加载分集";
+      actions.appendChild(empty);
     } else {
       indexes.forEach((index) => {
         const part = parts[index];
@@ -265,7 +268,7 @@
           ? "source-part" : "source-load";
         button.textContent = candidatePartLabel(candidate, part, index) +
           (onlyPartIndex === undefined ? " 加载" : "");
-        button.onclick = () => postSuggestionLoad(candidate, index);
+        button.onclick = () => postSuggestionLoad(candidate, index, generation);
         actions.appendChild(button);
       });
     }
@@ -275,7 +278,11 @@
 
   iina.onMessage("file-context", (data) => {
     const context = data && data.context;
+    if (Number.isInteger(data && data.generation)) {
+      currentFileGeneration = data.generation;
+    }
     const target = document.getElementById("auto-file-context");
+    document.getElementById("auto-recommendations").textContent = "（暂无推荐）";
     if (!context) {
       target.textContent = "未加载本地文件";
       return;
@@ -285,6 +292,10 @@
   });
 
   iina.onMessage("suggestions", (data) => {
+    if (Number.isInteger(data && data.generation) &&
+        currentFileGeneration !== null && data.generation !== currentFileGeneration) {
+      return;
+    }
     const list = document.getElementById("auto-recommendations");
     list.textContent = "";
     const decision = data && data.decision;
@@ -302,13 +313,18 @@
       return;
     }
     candidates.forEach((candidate) => renderCandidate(list, candidate,
-      decision.decision === "load" ? decision.partIndex : undefined));
+      decision.decision === "load" ? decision.partIndex : undefined, data.generation));
   });
 
   iina.onMessage("candidates", (data) => {
+    if (Number.isInteger(data && data.generation) &&
+        currentFileGeneration !== null && data.generation !== currentFileGeneration) {
+      return;
+    }
     const list = document.getElementById("manual-source-list");
     list.textContent = "";
-    (data && data.candidates || []).forEach((candidate) => renderCandidate(list, candidate));
+    (data && data.candidates || []).forEach((candidate) => renderCandidate(
+      list, candidate, undefined, data.generation));
     if (!list.children.length) list.textContent = "（暂无候选）";
   });
 
@@ -327,9 +343,11 @@
   // Handshake with main.js; sidebar webview cannot touch iina API directly.
   iina.onMessage("state", (data) => {
     if (data && data.status === "idle") {
+      currentFileGeneration = null;
       setStatus("未加载", false);
       document.getElementById("auto-file-context").textContent = "未加载本地文件";
       document.getElementById("auto-recommendations").textContent = "（暂无推荐）";
+      document.getElementById("manual-source-list").textContent = "（空）";
     }
   });
 

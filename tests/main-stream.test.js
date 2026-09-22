@@ -1215,6 +1215,16 @@ test("drops a stale search response after end-file", async () => {
     assert.equal(fixture.sidebarMessages.filter((message) => message.name === "seasons").length, 0);
 });
 
+test("clears the sidebar source state after end-file", () => {
+    const fixture = loadMainFixture();
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/01.mp4");
+    fixture.eventHandlers["mpv.end-file"]({ reason: "eof" });
+
+    const state = fixture.sidebarMessages.filter((message) => message.name === "state").at(-1);
+    assert.equal(state.data.loaded, false);
+    assert.equal(state.data.status, "idle");
+});
+
 test("reports asynchronous recognition failures without an unhandled rejection", async () => {
     const fixture = loadMainFixture();
     fixture.context.recognizeCurrentFile = () => Promise.reject(new Error("recognizer failed"));
@@ -1533,6 +1543,7 @@ test("resolves an md link through its season before loading danmaku", async () =
 test("loads a sidebar recommendation through the main source loader", async () => {
     const fixture = loadMainFixture({ pageCount: 2 });
     await fixture.sidebarHandlers["load-suggestion"]({
+        generation: 0,
         candidate: {
             kind: "video", bvid: "BV1xx411c7mD", title: "Documentary",
             pages: [{ page: 1, part: "Intro", cid: 101 }, { page: 2, part: "Main", cid: 102 }]
@@ -1545,6 +1556,54 @@ test("loads a sidebar recommendation through the main source loader", async () =
     assert.equal(video.data.current, 1);
     assert.equal(fixture.overlayMessages.some((message) => message.name === "stream-start"), true);
     assert.deepEqual(fixture.osdMessages, ["已切换到「Demo 1」第 2 P"]);
+});
+
+test("hydrates manual video search candidates with every page before posting them", async () => {
+    const fixture = loadMainFixture({
+        httpGet(url, request) {
+            if (url.includes("/x/web-interface/search/type")) {
+                return sourceSearchResponse([{ bvid: "BV1xx411c7mD", title: "Documentary" }]);
+            }
+            if (url.includes("/x/web-interface/view")) {
+                return {
+                    statusCode: 200,
+                    text: JSON.stringify({ code: 0, data: {
+                        title: "Documentary", pages: [
+                            { page: 1, part: "Intro", cid: 101 },
+                            { page: 2, part: "Main", cid: 102 }
+                        ]
+                    } })
+                };
+            }
+            return undefined;
+        }
+    });
+
+    await fixture.sidebarHandlers["search-video"]({ keyword: "Documentary" });
+
+    const candidates = fixture.sidebarMessages.filter((message) => message.name === "candidates").at(-1);
+    assert.equal(candidates.data.generation, 0);
+    assert.equal(candidates.data.candidates[0].pages.length, 2);
+});
+
+test("rejects stale and out-of-range sidebar recommendations before invalidating playback", async () => {
+    const fixture = loadMainFixture({ pageCount: 1 });
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Show.S02E03.mkv");
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Other.S02E03.mkv");
+
+    await fixture.sidebarHandlers["load-suggestion"]({
+        generation: 1,
+        candidate: { kind: "video", bvid: "BV1xx411c7mD", pages: [{ page: 1, cid: 101 }] },
+        partIndex: 0
+    });
+    await fixture.sidebarHandlers["load-suggestion"]({
+        generation: 2,
+        candidate: { kind: "video", bvid: "BV1xx411c7mD", pages: [{ page: 1, cid: 101 }] },
+        partIndex: 1
+    });
+
+    assert.equal(fixture.overlayMessages.some((message) => message.name === "stream-start"), false);
+    assert.equal(fixture.sidebarMessages.some((message) => message.name === "video"), false);
 });
 
 test("persists a settings patch and returns the merged settings to the sidebar", () => {

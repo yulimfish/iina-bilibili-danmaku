@@ -69,14 +69,25 @@ function initializeSidebar() {
     sidebar.onMessage("load-suggestion", (data) => {
         const candidate = data && data.candidate;
         const partIndex = data && data.partIndex;
-        if (!candidate || !Number.isInteger(partIndex) || partIndex < 0) {
+        const generation = data && data.generation;
+        if (!candidate || !Number.isInteger(generation) || generation !== fileGeneration ||
+            !Number.isInteger(partIndex) || partIndex < 0) {
             return;
         }
-        const loadState = invalidateCurrentLoad();
         if (candidate.kind === "bangumi" && candidate.season_id) {
+            const episodes = candidateEpisodes(candidate);
+            if (partIndex >= episodes.length || !episodes[partIndex]) {
+                return;
+            }
+            const loadState = invalidateCurrentLoad();
             return loadSeasonById(String(candidate.season_id), loadState, null, null, partIndex);
         }
         if (candidate.kind === "video" && candidate.bvid) {
+            const pages = candidatePages(candidate);
+            if (partIndex >= pages.length || !pages[partIndex]) {
+                return;
+            }
+            const loadState = invalidateCurrentLoad();
             return loadBvid(candidate.bvid, loadState, null, partIndex);
         }
     });
@@ -87,7 +98,7 @@ function initializeSidebar() {
         return requestSourceSearch("video", data && data.keyword);
     });
     sidebar.onMessage("select-season", (data) => {
-        if (!data || !data.season_id) {
+        if (!data || !data.season_id || data.generation !== fileGeneration) {
             return;
         }
         const loadState = invalidateCurrentLoad();
@@ -1453,9 +1464,26 @@ async function searchSource(kind, keyword) {
             sidebar.postMessage("error", { message: "没有搜到相关结果，换个关键词试试" });
             return;
         }
+        let displayCandidates = candidates;
+        if (normalizedKind === "video") {
+            displayCandidates = await Promise.all(candidates.slice(0, 3).map(async (candidate) => {
+                try {
+                    return await fetchCandidateDetails(candidate,
+                        () => !isCurrentSearch(request.state)) || candidate;
+                } catch (e) {
+                    console.log(TAG + " manual candidate detail failed: " + e);
+                    return candidate;
+                }
+            }));
+            if (!isCurrentSearch(request.state)) {
+                return;
+            }
+        }
+        const generation = request.state.fileGeneration;
         if (normalizedKind === "bangumi") {
             console.log(TAG + " search: " + candidates.length + " seasons");
             sidebar.postMessage("seasons", {
+                generation: generation,
                 seasons: candidates.map((candidate) => ({
                     season_id: candidate.season_id,
                     title: candidate.title,
@@ -1464,8 +1492,12 @@ async function searchSource(kind, keyword) {
             });
             sidebar.postMessage("status", { text: "搜到 " + candidates.length + " 部番剧，请选择" });
         } else {
-            sidebar.postMessage("candidates", { kind: normalizedKind, candidates: candidates });
-            sidebar.postMessage("status", { text: "搜到 " + candidates.length + " 个视频，请选择" });
+            sidebar.postMessage("candidates", {
+                kind: normalizedKind,
+                generation: generation,
+                candidates: displayCandidates
+            });
+            sidebar.postMessage("status", { text: "搜到 " + displayCandidates.length + " 个视频，请选择" });
         }
     } catch (e) {
         if (!request || isCurrentSearch(request.state)) {
@@ -1892,6 +1924,7 @@ event.on("mpv.end-file", () => {
     currentFileIdentity = null;
     invalidateFileLoads();
     playbackState.time = null;
+    sidebar.postMessage("state", { loaded: false, status: "idle" });
 });
 
 console.log(TAG + " main entry loaded");

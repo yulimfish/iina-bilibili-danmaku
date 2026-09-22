@@ -36,10 +36,11 @@ function makeEl(init) {
         get() { return text + el.children.map((child) => child.textContent || "").join(""); },
         set(value) {
             text = value;
-            if (value === "") el.children.length = 0;
+            el.children.length = 0;
         }
     });
     el.appendChild = (child) => {
+        text = "";
         if (child && child.isFragment) {
             el.children.push(...child.children);
             child.children.length = 0;
@@ -136,8 +137,8 @@ test("renders file context and a recommendation with a delegated load action", (
     fixture.handlers["file-context"]({ context: {
         filename: "Show.S02E03.mkv", title: "Show", seasonNumber: 2,
         episodeNumber: 3, kindHint: "bangumi", confidence: "high"
-    } });
-    fixture.handlers.suggestions({ decision: {
+    }, generation: 1 });
+    fixture.handlers.suggestions({ generation: 1, decision: {
         decision: "load", kind: "bangumi", partIndex: 0,
         candidate: {
             kind: "bangumi", season_id: 12, title: "Show",
@@ -152,8 +153,57 @@ test("renders file context and a recommendation with a delegated load action", (
     assert.ok(load, "recommendation exposes a load button");
     load.onclick();
     assert.equal(fixture.messages.at(-1).name, "load-suggestion");
+    assert.equal(fixture.messages.at(-1).data.generation, 1);
     assert.equal(fixture.messages.at(-1).data.partIndex, 0);
     assert.equal(fixture.messages.at(-1).data.candidate.season_id, 12);
+});
+
+test("clears old recommendations and ignores stale suggestion messages after a file change", () => {
+    const fixture = loadSidebarFixture();
+    fixture.handlers["file-context"]({ context: { filename: "Show.S02E03.mkv" }, generation: 1 });
+    fixture.handlers.suggestions({ generation: 1, decision: {
+        decision: "recommend", kind: "video", candidates: [{
+            kind: "video", bvid: "BV1xx411c7mD", title: "Show",
+            pages: [{ page: 1, part: "Main", cid: 101 }]
+        }]
+    } });
+    assert.match(fixture.elements["auto-recommendations"].textContent, /Show/);
+
+    fixture.handlers["file-context"]({ context: { filename: "Other.S02E03.mkv" }, generation: 2 });
+    fixture.handlers.suggestions({ generation: 1, decision: {
+        decision: "recommend", kind: "video", candidates: [{
+            kind: "video", bvid: "BV1xx411c7mD", title: "Old Show",
+            pages: [{ page: 1, part: "Main", cid: 101 }]
+        }]
+    } });
+
+    assert.equal(fixture.elements["auto-recommendations"].textContent, "（暂无推荐）");
+    assert.equal(descendants(fixture.elements["auto-recommendations"])
+        .some((node) => hasClass(node, "source-load") || hasClass(node, "source-part")), false);
+});
+
+test("manual video candidates carry the current file generation into load actions", () => {
+    const fixture = loadSidebarFixture();
+    fixture.handlers.candidates({ generation: 3, kind: "video", candidates: [{
+        kind: "video", bvid: "BV1xx411c7mD", title: "Documentary",
+        pages: [{ page: 1, part: "Intro", cid: 101 }, { page: 2, part: "Main", cid: 102 }]
+    }] });
+
+    const parts = descendants(fixture.elements["manual-source-list"])
+        .filter((node) => hasClass(node, "source-part"));
+    parts[1].onclick();
+    assert.equal(fixture.messages.at(-1).data.generation, 3);
+});
+
+test("does not render a load action when candidate details have no parts", () => {
+    const fixture = loadSidebarFixture();
+    fixture.handlers.candidates({ generation: 0, kind: "video", candidates: [{
+        kind: "video", bvid: "BV1xx411c7mD", title: "Unavailable"
+    }] });
+
+    assert.match(fixture.elements["manual-source-list"].textContent, /暂无可加载分集/);
+    assert.equal(descendants(fixture.elements["manual-source-list"])
+        .some((node) => hasClass(node, "source-load") || hasClass(node, "source-part")), false);
 });
 
 test("manual source mode sends search requests or direct source loads", () => {
@@ -184,7 +234,7 @@ test("manual source mode sends search requests or direct source loads", () => {
 
 test("video candidates expose every P as a delegated load action", () => {
     const fixture = loadSidebarFixture();
-    fixture.handlers.candidates({ kind: "video", candidates: [{
+    fixture.handlers.candidates({ generation: 0, kind: "video", candidates: [{
         kind: "video", bvid: "BV1xx411c7mD", title: "Documentary",
         pages: [{ page: 1, part: "Intro", cid: 101 }, { page: 2, part: "Main", cid: 102 }]
     }] });
@@ -198,6 +248,6 @@ test("video candidates expose every P as a delegated load action", () => {
         data: { candidate: {
             kind: "video", bvid: "BV1xx411c7mD", title: "Documentary",
             pages: [{ page: 1, part: "Intro", cid: 101 }, { page: 2, part: "Main", cid: 102 }]
-        }, partIndex: 1 }
+        }, generation: 0, partIndex: 1 }
     });
 });
