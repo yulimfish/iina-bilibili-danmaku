@@ -1189,6 +1189,27 @@ test("replays the current file context when the sidebar becomes ready", () => {
     assert.equal(contexts.at(-1).data.context.filename, "Show.S02E03.mkv");
 });
 
+test("publishes file context before asynchronous recognition can make a request", () => {
+    let requestCount = 0;
+    const fixture = loadMainFixture({
+        httpGet() {
+            requestCount += 1;
+            return undefined;
+        }
+    });
+    const startedAt = performance.now();
+
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Show.S02E03.mkv");
+
+    const elapsed = performance.now() - startedAt;
+    const contextMessage = fixture.sidebarMessages.find((message) =>
+        message.name === "file-context"
+    );
+    assert.equal(requestCount, 0);
+    assert.equal(contextMessage.data.context.filename, "Show.S02E03.mkv");
+    assert.ok(elapsed < 50, "file-loaded handler took " + elapsed + "ms");
+});
+
 test("drops a stale search response after the file changes", async () => {
     const response = deferred();
     const fixture = loadMainFixture({
@@ -1335,6 +1356,63 @@ test("keeps danmaku source handlers alive when the sidebar page loads late", asy
     assert.equal(typeof fixture.sidebarHandlers["search-bangumi"], "function");
     await fixture.sidebarHandlers["search-bangumi"]({ keyword: "demo" });
     assert.equal(fixture.sidebarMessages.filter((message) => message.name === "seasons").length, 1);
+});
+
+test("replays automatic suggestions when the sidebar becomes ready late", async () => {
+    const fixture = loadMainFixture({
+        windowLoadedInitially: false,
+        httpGet(url, request) {
+            if (url.includes("/x/web-interface/search/type")) {
+                return request.params.search_type === "video"
+                    ? sourceSearchResponse([])
+                    : sourceSearchResponse([{ season_id: 1, title: "Show", pubtime: 0 }]);
+            }
+            if (url.includes("/pgc/view/web/season")) {
+                return seasonDetailResponse("Show", [{ id: 3, cid: 103, title: "3" }]);
+            }
+            return undefined;
+        }
+    });
+
+    fixture.core.window.loaded = true;
+    fixture.eventHandlers["iina.window-loaded"]();
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Show.S02E03.mkv");
+    await wait(15);
+
+    assert.equal(fixture.sidebarMessages.filter((message) => message.name === "suggestions").length, 1);
+    fixture.sidebarHandlers["sidebar-ready"]({});
+    const suggestions = fixture.sidebarMessages.filter((message) => message.name === "suggestions");
+    assert.equal(suggestions.length, 2);
+    assert.equal(suggestions.at(-1).data.generation, 1);
+    assert.equal(suggestions.at(-1).data.decision.decision, "load");
+});
+
+test("does not replay stale suggestions after end-file or a new file", async () => {
+    const fixture = loadMainFixture({
+        httpGet(url, request) {
+            if (url.includes("/x/web-interface/search/type")) {
+                return request.params.search_type === "video"
+                    ? sourceSearchResponse([])
+                    : sourceSearchResponse([{ season_id: 1, title: "Show", pubtime: 0 }]);
+            }
+            if (url.includes("/pgc/view/web/season")) {
+                return seasonDetailResponse("Show", [{ id: 3, cid: 103, title: "3" }]);
+            }
+            return undefined;
+        }
+    });
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Show.S02E03.mkv");
+    await wait(15);
+    const before = fixture.sidebarMessages.filter((message) => message.name === "suggestions").length;
+    assert.equal(before, 1);
+
+    fixture.eventHandlers["mpv.end-file"]({ reason: "eof" });
+    fixture.sidebarHandlers["sidebar-ready"]({});
+    assert.equal(fixture.sidebarMessages.filter((message) => message.name === "suggestions").length, before);
+
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Show.S02E03.mkv");
+    fixture.sidebarHandlers["sidebar-ready"]({});
+    assert.equal(fixture.sidebarMessages.filter((message) => message.name === "suggestions").length, before);
 });
 
 test("coalesces repeated pending searches for the same normalized keyword", async () => {

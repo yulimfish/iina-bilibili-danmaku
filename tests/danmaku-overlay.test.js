@@ -146,13 +146,13 @@ function loadOverlay(options = {}) {
         document,
         window: {
             innerWidth: 1920,
-            BiliDanmakuParser: parser,
+            BiliDanmakuParser: options.parser || parser,
             requestAnimationFrame,
             addEventListener() {}
         },
         CommentManager: FakeCommentManager,
         Worker: FakeWorker,
-        BiliDanmakuParser: null,
+        BiliDanmakuParser: options.parser || parser,
         iina: {
             onMessage(name, handler) { handlers[name] = handler; },
             postMessage(name, data) { outgoing.push({ name, data }); }
@@ -553,6 +553,64 @@ test("fallback acknowledges a main chunk after all slices are parsed", async () 
     assert.equal(fixture.outgoing.filter((message) =>
         message.name === "stream-chunk-consumed" && message.data.streamId === 23 &&
         message.data.chunkId === 6
+    ).length, 1);
+});
+
+test("fallback keeps each parser slice within the 16 KiB budget", async () => {
+    const sliceLengths = [];
+    const fallbackParser = {
+        createStreamingParser() {
+            return {
+                push(chunk) {
+                    sliceLengths.push(chunk.length);
+                    return { parsed: 0, accepted: 0, skipped: 0 };
+                },
+                finish() {
+                    return { parsed: 0, accepted: 0, skipped: 0 };
+                }
+            };
+        }
+    };
+    const fixture = loadOverlay({ disableWorker: true, parser: fallbackParser });
+    fixture.send("stream-start", { streamId: 24 });
+    fixture.send("stream-chunk", {
+        streamId: 24,
+        chunkId: 7,
+        chunk: "x".repeat(16 * 1024 * 2 + 3)
+    });
+    await wait(20);
+
+    assert.deepEqual(sliceLengths, [16 * 1024, 16 * 1024, 3]);
+});
+
+test("worker onerror replays the pending chunk through 16 KiB fallback slices", async () => {
+    const sliceLengths = [];
+    const fallbackParser = {
+        createStreamingParser() {
+            return {
+                push(chunk) {
+                    sliceLengths.push(chunk.length);
+                    return { parsed: 0, accepted: 0, skipped: 0 };
+                },
+                finish() {
+                    return { parsed: 0, accepted: 0, skipped: 0 };
+                }
+            };
+        }
+    };
+    const fixture = loadOverlay({ parser: fallbackParser });
+    fixture.send("stream-start", { streamId: 25 });
+    fixture.send("stream-chunk", {
+        streamId: 25,
+        chunkId: 8,
+        chunk: "x".repeat(16 * 1024 * 2 + 3)
+    });
+    fixture.workers[0].onerror({ message: "worker script failed" });
+    await wait(20);
+
+    assert.deepEqual(sliceLengths, [16 * 1024, 16 * 1024, 3]);
+    assert.equal(fixture.outgoing.filter((message) =>
+        message.name === "stream-chunk-consumed" && message.data.streamId === 25
     ).length, 1);
 });
 

@@ -128,6 +128,9 @@ function initializeSidebar() {
         if (currentFileContextState) {
             sidebar.postMessage("file-context", currentFileContextState);
         }
+        if (currentSuggestionsState) {
+            sidebar.postMessage("suggestions", currentSuggestionsState);
+        }
     });
     sidebar.onMessage("update-settings", (data) => {
         if (data && data.patch) {
@@ -169,6 +172,7 @@ let fileGeneration = 0; // invalidates work from an older local file
 let searchGeneration = 0; // invalidates stale search results without clearing danmaku
 let currentFileIdentity = null;
 let currentFileContextState = null;
+let currentSuggestionsState = null;
 const pendingSearches = new Map();
 const SEARCH_CACHE_TTL = 10 * 60 * 1000;
 const searchCache = new Map();
@@ -725,6 +729,7 @@ async function recognizeCurrentFile(context, generation, recognitionSearchGenera
         candidates: ordered,
         decision: decision
     };
+    currentSuggestionsState = result;
     sidebar.postMessage("suggestions", result);
     if (decision.decision === "load" && automaticLoadEnabled(kind)) {
         await loadAutomaticDecision(context, generation, decision);
@@ -798,6 +803,7 @@ function handleFileLoaded(data) {
     const generation = fileGeneration;
     const recognitionSearchGeneration = searchGeneration;
     currentFileContextState = { context: context, generation: generation };
+    currentSuggestionsState = null;
     sidebar.postMessage("file-context", currentFileContextState);
     Promise.resolve().then(() => recognizeCurrentFile(
         context, generation, recognitionSearchGeneration
@@ -1928,6 +1934,7 @@ event.on("mpv.end-file", () => {
     fileGeneration += 1;
     currentFileIdentity = null;
     currentFileContextState = null;
+    currentSuggestionsState = null;
     invalidateFileLoads();
     playbackState.time = null;
     sidebar.postMessage("state", { loaded: false, status: "idle" });
