@@ -1208,6 +1208,7 @@ test("publishes file context before asynchronous recognition can make a request"
     assert.equal(requestCount, 0);
     assert.equal(contextMessage.data.context.filename, "Show.S02E03.mkv");
     assert.ok(elapsed < 50, "file-loaded handler took " + elapsed + "ms");
+    console.log("[perf] file-loaded sync handler: " + elapsed.toFixed(3) + "ms, http=" + requestCount);
 });
 
 test("drops a stale search response after the file changes", async () => {

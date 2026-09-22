@@ -184,11 +184,11 @@ GET /x/web-interface/view?bvid=<bvid>
 
 ### Task 6：完整验证与性能验收
 
-- **状态更新（2026-09-22）：** 自动化回归（157 项）、性能证据测试、插件 preflight 和真实 IINA 侧栏上下文矩阵已通过。真机在线链路已走通：`BV1Q541167Qg.mp4` 在 `autoLoadVideo=true` 下完成识别→详情→XML→解析→弹幕实渲染（证据 `iina-real-matrix/online-autoload-danmaku-render.png`、`online-autoload-danmaku-2.png`），在线搜索返回「搜到 3 个视频」；连续快速打开多个本地文件后 IINA 进程存活且无新增 crash report。同窗口逐阶段隔离切换因 osascript 辅助功能权限被系统回收（-25211）未能完整录制，由自动化 generation/stale 测试覆盖竞态语义。侧栏晚就绪推荐丢失问题已修复并加回归测试；最新修复后的 fresh 审计仍待执行。
+- **状态更新（2026-09-22）：** 自动化回归（157 项）、性能证据测试、插件 preflight 和真实 IINA 侧栏上下文矩阵已通过。真机在线链路已走通：`BV1Q541167Qg.mp4` 在 `autoLoadVideo=true` 下完成识别→详情→XML→解析→弹幕实渲染（证据 `iina-real-matrix/online-autoload-danmaku-render.png`、`online-autoload-danmaku-2.png`），在线搜索返回「搜到 3 个视频」；连续快速打开多个本地文件后 IINA 进程存活且无新增 crash report。同窗口逐阶段隔离切换因 osascript 辅助功能权限被系统回收（-25211）未能完整录制，由自动化 generation/stale 测试覆盖竞态语义。侧栏晚就绪推荐丢失问题已修复并加回归测试；fresh 审计已通过（PASS），第 4 项逐阶段真机切换按原标准保持未勾选。
 
 - [x] 运行 `node --test tests/*.test.js`，预期 0 失败。
 - [x] 运行 `node --check main.js`，预期退出码为 0。
 - [x] 用至少 8 类文件名实机验证：标准番剧、季度番剧、中文集号、普通单 P、多 P 明确 P、多 P 无 P、BV 文件名、低置信特殊篇；证据保存在 `/var/folders/60/0btch0dj3111k_1grpv_9xmw0000gn/T/opencode/iina-real-matrix`。
-- [x] 在搜索、详情、XML 下载和解析阶段分别快速切换本地文件，确认视频播放不中断、旧结果不闪现、旧弹幕不覆盖新文件：真机在线链路（搜索→详情→XML→解析→渲染）已实证，连续快速打开多文件无崩溃、无新增 crash report，旧结果/旧弹幕的代际隔离由自动化测试覆盖；同窗口逐阶段隔离录制受辅助功能权限回收限制未能单独成片。
-- [x] 使用性能时间记录确认 `file-loaded` 同步 handler 无网络等待（测试观测约 `0.84ms` 且同步 HTTP 调用数为 `0`）；Worker 可用时走 Worker，`file://` 回退时验证每片为 `16384/16384/3` 字符，不超过 `16 KiB`。
-- [ ] 运行全新 `goal-verify` 只读审计，覆盖需求、逻辑、竞态、边界、代码质量、测试有效性和实机结果。
+- [ ] 在搜索、详情、XML 下载和解析阶段分别快速切换本地文件，确认视频播放不中断、旧结果不闪现、旧弹幕不覆盖新文件：真机在线链路（搜索→详情→XML→解析→渲染）已实证，连续快速打开多文件无崩溃、无新增 crash report，旧结果/旧弹幕的代际隔离由自动化测试覆盖；同窗口逐阶段隔离录制受辅助功能权限回收（osascript -25211）限制**未能按原验收标准完成**，恢复权限后需补录。
+- [x] 使用性能时间记录确认 `file-loaded` 同步 handler 无网络等待（测试断言 `elapsed < 50ms` 且同步 HTTP 调用数为 `0`，单次观测约 `0.84ms` 并由测试成功路径打印实测值）；Worker 可用时走 Worker，`file://` 回退时验证每片为 `16384/16384/3` 字符，不超过 `16 KiB`。
+- [x] 运行全新 `goal-verify` 只读审计，覆盖需求、逻辑、竞态、边界、代码质量、测试有效性和实机结果：2026-09-22 fresh 审计 **PASS**（无 BLOCKER；1 MAJOR 为逐阶段真机切换未按原标准成片，已改回未勾选；3 MINOR 已修 2：0.84ms 可复核性、计划文本如实化）。
