@@ -184,8 +184,10 @@ GET /x/web-interface/view?bvid=<bvid>
 
 ### Task 6：完整验证与性能验收
 
-- [ ] 运行 `node --test tests/*.test.js`，预期 0 失败。
-- [ ] 运行 `node --check main.js`，预期退出码为 0。
+- **状态更新（2026-09-22）：** 自动化回归与插件 preflight 已通过；IINA 实机仍受原生 `JavascriptAPISidebarView.loadFile(_:)` 崩溃阻塞，因此实机、快速切换和性能项目保持未完成。上一轮独立代码审计未发现 BLOCKER/MAJOR。
+
+- [x] 运行 `node --test tests/*.test.js`，预期 0 失败。
+- [x] 运行 `node --check main.js`，预期退出码为 0。
 - [ ] 用至少 8 类文件名实机验证：标准番剧、季度番剧、中文集号、普通单 P、多 P 明确 P、多 P 无 P、BV 文件名、低置信特殊篇。
 - [ ] 在搜索、详情、XML 下载和解析阶段分别快速切换本地文件，确认视频播放不中断、旧结果不闪现、旧弹幕不覆盖新文件。
 - [ ] 使用性能面板或时间记录确认 `file-loaded` 同步 handler 无网络等待；Worker 可用时解析在 Worker，file:// 回退时每片仍不超过 `16 KiB`。
