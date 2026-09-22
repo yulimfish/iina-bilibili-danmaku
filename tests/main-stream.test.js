@@ -1177,6 +1177,18 @@ test("publishes each distinct file context once", () => {
     assert.equal(contexts[1].data.context.episodeNumber, 2);
 });
 
+test("replays the current file context when the sidebar becomes ready", () => {
+    const fixture = loadMainFixture();
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Show.S02E03.mkv");
+
+    fixture.sidebarHandlers["sidebar-ready"]({});
+
+    const contexts = fixture.sidebarMessages.filter((message) => message.name === "file-context");
+    assert.equal(contexts.length, 2);
+    assert.equal(contexts.at(-1).data.generation, 1);
+    assert.equal(contexts.at(-1).data.context.filename, "Show.S02E03.mkv");
+});
+
 test("drops a stale search response after the file changes", async () => {
     const response = deferred();
     const fixture = loadMainFixture({

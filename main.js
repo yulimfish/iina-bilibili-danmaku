@@ -125,6 +125,9 @@ function initializeSidebar() {
         postFontList();
         sidebar.postMessage("state", { loaded: false, status: "idle" });
         sidebar.postMessage("settings", { settings: settings });
+        if (currentFileContextState) {
+            sidebar.postMessage("file-context", currentFileContextState);
+        }
     });
     sidebar.onMessage("update-settings", (data) => {
         if (data && data.patch) {
@@ -165,6 +168,7 @@ let loadToken = 0; // guards against overlapping adopted source loads
 let fileGeneration = 0; // invalidates work from an older local file
 let searchGeneration = 0; // invalidates stale search results without clearing danmaku
 let currentFileIdentity = null;
+let currentFileContextState = null;
 const pendingSearches = new Map();
 const SEARCH_CACHE_TTL = 10 * 60 * 1000;
 const searchCache = new Map();
@@ -793,7 +797,8 @@ function handleFileLoaded(data) {
     invalidateFileLoads();
     const generation = fileGeneration;
     const recognitionSearchGeneration = searchGeneration;
-    sidebar.postMessage("file-context", { context: context, generation: generation });
+    currentFileContextState = { context: context, generation: generation };
+    sidebar.postMessage("file-context", currentFileContextState);
     Promise.resolve().then(() => recognizeCurrentFile(
         context, generation, recognitionSearchGeneration
     )).catch((e) => {
@@ -1922,6 +1927,7 @@ event.on("iina.file-loaded", handleFileLoaded);
 event.on("mpv.end-file", () => {
     fileGeneration += 1;
     currentFileIdentity = null;
+    currentFileContextState = null;
     invalidateFileLoads();
     playbackState.time = null;
     sidebar.postMessage("state", { loaded: false, status: "idle" });
