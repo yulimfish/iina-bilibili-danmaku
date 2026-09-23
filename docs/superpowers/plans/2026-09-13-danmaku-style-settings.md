@@ -166,5 +166,5 @@ document.documentElement.style.setProperty(
 - [x] 运行 `node --test tests/*.test.js`，预期 0 失败。
 - [x] 运行 `node --check main.js && node --check overlay/danmaku.js`，预期全部退出码为 0。
 - [ ] 在 IINA 1.4.4 实机逐个切换五个字体预设和 `0/0.5/1/2/3px` 描边，确认在屏弹幕立即变化、彩色弹幕颜色保留、播放和解析不中断。
-- [ ] 重启 IINA，确认字体与描边持久化；旧版 settings 自动补齐默认值。
+- [x] 重启 IINA，确认字体与描边持久化；旧版 settings 自动补齐默认值（2026-09-21 实机记录：重启后 plist 补写 `strokeColor` 默认值，保留用户已有字体/描边设置；旧设置迁移回写由自动化测试覆盖）。
 - [x] 运行全新 `goal-verify` 只读审计，覆盖需求、逻辑、边界、代码质量、测试有效性和实机结果。
