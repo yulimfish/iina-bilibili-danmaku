@@ -780,6 +780,6 @@ While a local video is playing, load a dense BV source and verify:
 - Selecting another part/source stops old progress and old comments cannot reappear.
 - Network/API errors and Worker errors leave the sidebar available for another load.
 
-- [ ] **Step 5: Run the independent audit**
+- [x] **Step 5: Run the independent audit** — 2026-09-24 fresh `goal-verify` review: CONDITIONAL PASS; no BLOCKER, one MAJOR remains because the required real-IINA streaming matrix in Step 4 is not yet verified. Automated tests and syntax checks pass; this does not substitute for the pending device validation.
 
 Dispatch a fresh read-only `goal-verify` audit against the final diff and the approved design. Require checks for requirements, logic, edge cases, code quality, non-tautological tests, and actual test/runtime results. Fix all BLOCKER findings and cheap MAJOR findings, then rerun the audit before delivery.
