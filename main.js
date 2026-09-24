@@ -485,6 +485,7 @@ const MEDIA_CHINESE_EPISODE = /第\s*0*(\d{1,4})\s*(?:集|话|話|回)/;
 const MEDIA_CHINESE_PART = /分\s*P\s*0*(\d+)(?=$|[.\s_-])/i;
 const MEDIA_EXPLICIT_PART = /(?:^|[.\s_-])(?:Part|P)\s*0*(\d+)(?=$|[.\s_-])/i;
 const MEDIA_TRAILING_EPISODE = /(?:^|-)\s*0*(\d{1,3})\s*$/;
+const MEDIA_GENERIC_DIRECTORY = /^(?:tmp|temp|test|tests|downloads?|desktop|documents?|movies|videos?|anime|season(?:\s*\d+)?|series(?:\s*\d+)?|disc\s*\d+|disk\s*\d+|cd\s*\d+)$/i;
 
 function cleanMediaSource(filename) {
     let source = typeof filename === "string" ? filename.trim() : "";
@@ -527,14 +528,25 @@ function buildMediaFilenameResult(filename, title, fields) {
     };
 }
 
-function parseMediaFilename(filename) {
+function parseMediaFilename(filename, parentDirectory) {
     const rawFilename = typeof filename === "string" ? filename.trim() : "";
     const source = cleanMediaSource(rawFilename);
-    const title = normalizeMediaTitle(source);
+    const filenameTitle = normalizeMediaTitle(source);
+    const directoryTitle = normalizeMediaTitle(cleanMediaSource(parentDirectory));
     const bvidMatch = /BV[a-zA-Z0-9]{10}/.exec(source);
     const bvid = bvidMatch ? bvidMatch[0] : null;
     const partMatch = MEDIA_CHINESE_PART.exec(source) || MEDIA_EXPLICIT_PART.exec(source);
     const partNumber = partMatch ? Number(partMatch[1]) : null;
+    const seasonEpisodeMatch = MEDIA_SEASON_EPISODE.exec(source);
+    const chineseEpisodeMatch = MEDIA_CHINESE_EPISODE.exec(source);
+    const trailingEpisodeMatch = MEDIA_TRAILING_EPISODE.exec(source);
+    const hasEpisodeNumber = Boolean(
+        seasonEpisodeMatch || chineseEpisodeMatch || trailingEpisodeMatch
+    );
+    const title = hasEpisodeNumber && !bvid && partNumber === null && directoryTitle &&
+        !MEDIA_GENERIC_DIRECTORY.test(directoryTitle)
+        ? directoryTitle : filenameTitle;
+
     if (bvid) {
         return buildMediaFilenameResult(rawFilename, title, {
             seasonNumber: null,
@@ -545,7 +557,6 @@ function parseMediaFilename(filename) {
         });
     }
 
-    const seasonEpisodeMatch = MEDIA_SEASON_EPISODE.exec(source);
     if (seasonEpisodeMatch) {
         return buildMediaFilenameResult(rawFilename, title, {
             seasonNumber: Number(seasonEpisodeMatch[1]),
@@ -556,7 +567,6 @@ function parseMediaFilename(filename) {
         });
     }
 
-    const chineseEpisodeMatch = MEDIA_CHINESE_EPISODE.exec(source);
     if (chineseEpisodeMatch) {
         return buildMediaFilenameResult(rawFilename, title, {
             seasonNumber: null,
@@ -567,7 +577,6 @@ function parseMediaFilename(filename) {
         });
     }
 
-    const trailingEpisodeMatch = MEDIA_TRAILING_EPISODE.exec(source);
     if (trailingEpisodeMatch && title.length > 0) {
         return buildMediaFilenameResult(rawFilename, title, {
             seasonNumber: null,
@@ -611,18 +620,33 @@ function mediaFilenameFromSource(value) {
     return segments[segments.length - 1] || source;
 }
 
+function mediaDirectoryNameFromSource(value) {
+    let source = safelyDecodeMediaSource(String(value || "").replace(/[?#].*$/, ""));
+    source = source.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
+    const segments = source.split(/[\\/]/).filter(Boolean);
+    return segments.length > 1 ? segments[segments.length - 2] : "";
+}
+
 function currentFileContext(url) {
+    let sourcePath = "";
+    try {
+        sourcePath = mpv.getString("path") || "";
+    } catch (e) { /* path lookup is unavailable in some fixtures/versions */ }
+    if (!sourcePath) {
+        sourcePath = url || (core.status && core.status.url) || "";
+    }
+
     let filename = "";
     try {
         filename = mpv.getString("filename") || "";
     } catch (e) { /* filename lookup is unavailable in some fixtures/versions */ }
     if (!filename) {
-        const fallback = url || (core.status && core.status.url) || "";
-        filename = mediaFilenameFromSource(fallback);
+        filename = mediaFilenameFromSource(sourcePath);
     } else {
         filename = mediaFilenameFromSource(filename);
     }
-    return Object.assign(parseMediaFilename(filename), {
+    const parentDirectory = mediaDirectoryNameFromSource(sourcePath);
+    return Object.assign(parseMediaFilename(filename, parentDirectory), {
         url: url || (core.status && core.status.url) || null
     });
 }

@@ -149,7 +149,8 @@ function loadMainFixture(options = {}) {
             return name === "pause" ? Boolean(core.status.paused) : false;
         },
         getString(name) {
-            return name === "filename" ? (options.filename || "") : "";
+            if (name === "filename") return options.filename || "";
+            return name === "path" ? (options.path || "") : "";
         }
     };
     const prefsStore = {};
@@ -698,6 +699,33 @@ test("does not start recognition after a manual load wins before recognition beg
 
     assert.equal(searchRequests, 0);
     assert.equal(fixture.sidebarMessages.filter((message) => message.name === "suggestions").length, 0);
+});
+
+test("uses the parent directory title for automatic episode searches", async () => {
+    const searchRequests = [];
+    const fixture = loadMainFixture({
+        filename: "Sousou no Frieren - 05.mkv",
+        path: "/library/葬送的芙莉莲/Sousou no Frieren - 05.mkv",
+        httpGet(url, request) {
+            if (!url.includes("/x/web-interface/search/type")) return undefined;
+            searchRequests.push(request);
+            return sourceSearchResponse([]);
+        }
+    });
+
+    fixture.eventHandlers["iina.file-loaded"](
+        "file:///library/%E8%91%AC%E9%80%81%E7%9A%84%E8%8A%99%E8%8E%89%E8%8E%B2/Sousou%20no%20Frieren%20-%2005.mkv"
+    );
+    await wait(10);
+
+    const suggestions = fixture.sidebarMessages.filter((message) => message.name === "suggestions");
+    assert.equal(suggestions.length, 1);
+    assert.equal(suggestions[0].data.context.title, "葬送的芙莉莲");
+    assert.equal(suggestions[0].data.context.episodeNumber, 5);
+    assert.deepEqual(
+        searchRequests.map((request) => request.params.keyword),
+        ["葬送的芙莉莲", "葬送的芙莉莲"]
+    );
 });
 
 test("recognizes a unique single-part video candidate and resolves its details", async () => {
