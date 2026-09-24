@@ -768,7 +768,7 @@ git status --short
 
 Confirm there is no `overlay/danmaku.js` reference to `cachedXml`, `scaledXml`, `CommentProvider`, or a one-shot `postMessage("load", ...)`, and no unrelated file was changed.
 
-- [ ] **Step 4: Perform manual IINA verification**
+- [x] **Step 4: Perform manual IINA verification** — 用户于 2026-09-24 豁免剩余实机矩阵；除前述已有真机证据外，本清单中其他场景未执行，不代表通过。
 
 While a local video is playing, load a dense BV source and verify:
 
