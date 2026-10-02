@@ -125,6 +125,9 @@ function initializeSidebar() {
         postFontList();
         sidebar.postMessage("state", { loaded: false, status: "idle" });
         sidebar.postMessage("settings", { settings: settings });
+        postAuthState();
+        if (qrState) sidebar.postMessage("auth-qr", qrState);
+        sidebar.postMessage("history-progress", historyProgress);
         if (currentFileContextState) {
             sidebar.postMessage("file-context", currentFileContextState);
         }
@@ -137,6 +140,11 @@ function initializeSidebar() {
             applySettings(data.patch);
         }
     });
+    sidebar.onMessage("auth-cookie", (data) => loginWithCookie(data && data.cookie));
+    sidebar.onMessage("auth-qr-start", startQrLogin);
+    sidebar.onMessage("auth-qr-cancel", () => cancelQrLogin(true));
+    sidebar.onMessage("auth-logout", logout);
+    sidebar.onMessage("history-cancel", () => cancelHistoryBackfill("已取消回补，保留已获取的弹幕"));
     sidebar.onMessage("clear-danmaku", () => {
         invalidateCurrentLoad();
         sidebar.postMessage("status", { text: "已清空弹幕" });
@@ -203,8 +211,7 @@ const DEFAULT_SETTINGS = {
     speed: 680, // CCL scroll baseline; larger = faster
     offset: 0, // seconds added to playback position
     autoLoadBangumi: false,
-    autoLoadVideo: false,
-    sessdata: "" // user's own Bilibili login cookie (SESSDATA value only)
+    autoLoadVideo: false
 };
 
 const FONT_FAMILY_SANITIZER = /^[^;{}()<>\\",'\r\n]+$/;
@@ -221,7 +228,7 @@ function sanitizeSessdata(value) {
     if (typeof value !== "string") {
         return "";
     }
-    const trimmed = value.trim().replace(SESSDATA_PREFIX, "").trim();
+    const trimmed = value.trim().replace(SESSDATA_PREFIX, "").trim().replace(/,/g, "%2C");
     if (trimmed.length < SESSDATA_MIN_LENGTH || trimmed.length > SESSDATA_MAX_LENGTH ||
         !SESSDATA_SANITIZER.test(trimmed)) {
         return "";
@@ -231,6 +238,20 @@ function sanitizeSessdata(value) {
 
 let settings = Object.assign({}, DEFAULT_SETTINGS);
 let fonts = null; // installed font families; null = enumeration unavailable
+const AUTH_SERVICE = "bilibili";
+const AUTH_ACCOUNT = "SESSDATA";
+let sessdata = ""; // Main-entry memory only; never included in settings/messages.
+let legacySessdata = ""; // Retain the old preference until migration and cleanup both succeed.
+let legacyPreferencePendingClear = false;
+let authGeneration = 0;
+let credentialDeletion = null;
+let credentialStored = false;
+let accountInfo = null;
+let authState = { status: "anonymous", loggedIn: false, account: null, message: "未登录 · 匿名模式" };
+let qrState = null;
+let qrJob = null;
+let historyJob = null;
+let historyProgress = { active: false, text: "登录后加载来源可回补历史弹幕", completed: 0, total: 0, added: 0 };
 
 // Returns a trimmed, injection-safe font family name, or null when invalid.
 function sanitizeFontFamily(value) {
@@ -261,8 +282,6 @@ function normalizeSettings(candidate) {
             if (family !== null) {
                 normalized[key] = family;
             }
-        } else if (key === "sessdata") {
-            normalized[key] = sanitizeSessdata(value);
         } else if (key === "strokeColor") {
             if (typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value)) {
                 normalized[key] = value;
@@ -286,24 +305,36 @@ function loadSettings() {
     try {
         const stored = preferences.get("settings");
         settings = normalizeSettings(stored);
+        loadCredential(stored);
         // Rewrite the plist when stored settings predate new keys or normalize
         // corrected a value, so updates migrate without any sidebar interaction.
         const isPlain = Boolean(stored) && typeof stored === "object" && !Array.isArray(stored);
         const needsMigration = !isPlain ||
             !Object.prototype.hasOwnProperty.call(stored, "fontFamily") ||
             !Object.prototype.hasOwnProperty.call(stored, "strokeColor") ||
+            Object.prototype.hasOwnProperty.call(stored, "sessdata") ||
             Object.keys(DEFAULT_SETTINGS).some((key) => stored[key] !== settings[key]);
-        if (needsMigration) {
-            saveSettings();
+        if (needsMigration && !saveSettings() && legacyPreferencePendingClear) {
+            setAuthState("error", "钥匙串迁移已完成，但旧版设置中的 SESSDATA 尚未清除；请稍后退出登录重试");
         }
     } catch (e) { /* ignore */ }
 }
 
 function saveSettings() {
     try {
-        preferences.set("settings", settings);
+        // Preserve an old token when Keychain migration failed; once migration
+        // succeeded, retain it in memory until the preference rewrite succeeds.
+        preferences.set("settings", legacySessdata && !legacyPreferencePendingClear
+            ? Object.assign({}, settings, { sessdata: legacySessdata }) : settings);
         preferences.sync();
-    } catch (e) { /* ignore */ }
+        if (legacyPreferencePendingClear) {
+            legacySessdata = "";
+            legacyPreferencePendingClear = false;
+        }
+        return true;
+    } catch (e) {
+        return false;
+    }
 }
 
 function overlaySettings() {
@@ -353,6 +384,330 @@ function applySettings(patch) {
         }
     }
     sidebar.postMessage("settings", { settings: settings });
+}
+
+// Credentials never travel through ordinary settings or overlay messages.
+function readKeychain() {
+    const read = utils.keychainRead || utils.keyChainRead;
+    return typeof read === "function" ? read.call(utils, AUTH_SERVICE, AUTH_ACCOUNT) : false;
+}
+
+function writeKeychain(value) {
+    const write = utils.keychainWrite || utils.keyChainWrite;
+    try {
+        return typeof write === "function" && write.call(utils, AUTH_SERVICE, AUTH_ACCOUNT, value) === true &&
+            readKeychain() === value;
+    } catch (e) {
+        return false;
+    }
+}
+
+function postAuthState() {
+    sidebar.postMessage("auth-state", authState);
+}
+
+function setAuthState(status, message) {
+    authState = { status: status, loggedIn: Boolean(sessdata), canLogout: credentialStored || Boolean(legacySessdata),
+        account: accountInfo, message: message };
+    postAuthState();
+}
+
+function accountProfile(data) {
+    if (!data || typeof data !== "object") return null;
+    const numeric = (value) => (typeof value === "number" && Number.isFinite(value)) ||
+        (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value)))
+        ? Number(value) : null;
+    const vip = data.vip && typeof data.vip === "object" ? data.vip : {};
+    const label = data.vip_label && typeof data.vip_label === "object" ? data.vip_label :
+        vip.label && typeof vip.label === "object" ? vip.label : {};
+    const uname = typeof data.uname === "string" ? data.uname.trim().slice(0, 80) : "";
+    const vipStatus = numeric(data.vipStatus) !== null ? numeric(data.vipStatus) : numeric(vip.status);
+    const vipType = numeric(data.vipType) !== null ? numeric(data.vipType) : numeric(vip.type);
+    const due = Number(data.vipDueDate !== undefined ? data.vipDueDate : vip.due_date);
+    return {
+        uname: uname || "B 站用户",
+        vipStatus: vipStatus,
+        vipType: vipType,
+        vipDueDate: Number.isFinite(due) && due > 0 ? due : null,
+        vipLabel: typeof label.text === "string" ? label.text.trim().slice(0, 40) : ""
+    };
+}
+
+function loadCredential(stored) {
+    legacySessdata = sanitizeSessdata(stored && stored.sessdata);
+    let saved = "";
+    try { saved = sanitizeSessdata(readKeychain()); } catch (e) { /* unavailable */ }
+    if (!saved && legacySessdata) {
+        if (writeKeychain(legacySessdata)) {
+            saved = legacySessdata;
+            legacyPreferencePendingClear = true;
+        }
+        else {
+            setAuthState("error", "旧登录态暂未迁入钥匙串；保留原设置，当前使用匿名模式");
+            return;
+        }
+    }
+    if (!saved) return;
+    if (legacySessdata) legacyPreferencePendingClear = true;
+    credentialStored = true;
+    const generation = authGeneration;
+    setAuthState("checking", "正在验证钥匙串中的登录态…");
+    validateCredential(saved).then((data) => {
+        if (generation === authGeneration) {
+            sessdata = saved;
+            accountInfo = accountProfile(data);
+            setAuthState("authenticated", legacySessdata
+                ? "已登录；旧版设置中的 SESSDATA 尚未清除，退出登录后可重试清理"
+                : "已登录，加载来源时将限速补充历史弹幕");
+        }
+    }).catch((e) => {
+        if (generation === authGeneration) {
+            cancelHistoryBackfill("启动登录验证失败，历史回补已停止", false);
+            sessdata = "";
+            accountInfo = null;
+            setAuthState(e && e.biliCode === -101 ? "expired" : "error", authErrorMessage(e));
+        }
+    });
+}
+
+function cookieSessdata(raw) {
+    if (typeof raw !== "string" || raw.length > 16384 || /[\r\n\x00]/.test(raw)) return "";
+    const match = /(?:^|;)\s*SESSDATA\s*=\s*([^;]*)/i.exec(raw);
+    if (match) return sanitizeSessdata(match[1]);
+    if (raw.indexOf(";") >= 0 || /^[a-z_][\w]*\s*=/i.test(raw.trim())) return "";
+    return sanitizeSessdata(raw);
+}
+
+async function validateCredential(value) {
+    const data = await biliApi("/x/web-interface/nav", {}, { Cookie: "SESSDATA=" + value });
+    if (!data || data.isLogin !== true) throw { biliCode: -101 };
+    return data;
+}
+
+function authErrorMessage(e) {
+    if (e && e.keychain) return "钥匙串保存失败，未启用新登录态；请检查系统授权后重试";
+    if (e && e.biliCode === -101) return "登录态已失效，已回退匿名模式；请重新扫码或粘贴 Cookie";
+    if (e && (e.biliCode === -412 || e.status === 412 || e.status === 429)) {
+        return "登录请求受限，请稍后重试；匿名加载仍可使用";
+    }
+    return "登录验证失败，请重试；匿名加载仍可使用";
+}
+
+async function acceptCredential(value, generation) {
+    const data = await validateCredential(value);
+    if (credentialDeletion) await credentialDeletion;
+    if (generation !== authGeneration) return false;
+    if (!writeKeychain(value)) throw { keychain: true };
+    sessdata = value;
+    accountInfo = accountProfile(data);
+    credentialStored = true;
+    if (legacySessdata) legacyPreferencePendingClear = true;
+    saveSettings();
+    setAuthState("authenticated", legacySessdata
+        ? "已登录；旧版设置中的 SESSDATA 尚未清除，退出登录后可重试清理"
+        : "已登录，加载来源时将限速补充历史弹幕");
+    return true;
+}
+
+async function loginWithCookie(raw) {
+    cancelQrLogin(false);
+    cancelHistoryBackfill("登录操作已开始，已停止历史回补");
+    const generation = ++authGeneration;
+    const value = cookieSessdata(raw);
+    if (!value) {
+        setAuthState("error", "Cookie 中未找到有效 SESSDATA，请检查粘贴内容");
+        return;
+    }
+    setAuthState("checking", "正在验证 Cookie…");
+    try {
+        await acceptCredential(value, generation);
+    } catch (e) {
+        if (generation === authGeneration) setAuthState("error", authErrorMessage(e));
+    }
+}
+
+function postQr(status, message, url) {
+    qrState = { status: status, message: message };
+    if (url) qrState.url = url;
+    sidebar.postMessage("auth-qr", qrState);
+}
+
+function cancelQrLogin(notify) {
+    if (qrJob) {
+        clearTimeout(qrJob.timer);
+        qrJob = null;
+    }
+    if (notify) {
+        cancelHistoryBackfill("扫码已取消，历史回补已停止");
+        authGeneration += 1;
+        postQr("cancelled", "已取消扫码");
+        setAuthState(sessdata ? "authenticated" : "anonymous", sessdata ? "已登录" : "未登录 · 匿名模式");
+    }
+}
+
+async function passportApi(action, params) {
+    const res = await http.get("https://passport.bilibili.com/x/passport-login/web/qrcode/" + action, {
+        params: params || {}, headers: BILI_HEADERS, data: {}
+    });
+    if (!res || res.statusCode !== 200) throw { status: res && res.statusCode };
+    const body = JSON.parse(res.text);
+    if (body.code !== 0 || !body.data) throw { biliCode: body.code };
+    return body.data;
+}
+
+async function startQrLogin() {
+    cancelQrLogin(false);
+    cancelHistoryBackfill("扫码登录已开始，已停止历史回补");
+    const job = { generation: ++authGeneration, timer: null, polls: 0, started: Date.now() };
+    qrJob = job;
+    postQr("loading", "正在生成二维码…");
+    try {
+        const data = await passportApi("generate");
+        if (qrJob !== job) return;
+        if (!/^[a-zA-Z0-9]{32}$/.test(data.qrcode_key || "") || typeof data.url !== "string" ||
+            !/^https:\/\/account\.bilibili\.com\/h5\/account-h5\/auth\/scan-web\?[^\s"'<>\\]+$/.test(data.url)) {
+            throw { invalidQr: true };
+        }
+        job.key = data.qrcode_key;
+        job.url = data.url;
+        postQr("waiting", "请用哔哩哔哩 App 扫码，并在手机上确认", job.url);
+        void pollQrLogin(job);
+    } catch (e) {
+        if (qrJob !== job) return;
+        qrJob = null;
+        postQr("error", "二维码生成失败，请刷新重试");
+    }
+}
+
+async function pollQrLogin(job) {
+    if (qrJob !== job || job.generation !== authGeneration) return;
+    if (++job.polls > 60 || Date.now() - job.started >= 180000) {
+        qrJob = null;
+        postQr("expired", "二维码已过期，请刷新");
+        return;
+    }
+    try {
+        const data = await passportApi("poll", { qrcode_key: job.key });
+        if (qrJob !== job || job.generation !== authGeneration) return;
+        if (data.code === 86101 || data.code === 86090) {
+            postQr(data.code === 86090 ? "scanned" : "waiting",
+                data.code === 86090 ? "已扫码，请在手机上确认登录" : "等待扫码…", job.url);
+            job.timer = setTimeout(() => { void pollQrLogin(job); }, 3000);
+            return;
+        }
+        if (data.code === 86038) {
+            qrJob = null;
+            postQr("expired", "二维码已过期，请刷新");
+            return;
+        }
+        if (data.code !== 0) throw { biliCode: data.code };
+        postQr("loading", "扫码已确认，正在验证登录态…");
+        const value = await exchangeQrTicket(data.url, () => qrJob !== job || job.generation !== authGeneration);
+        if (qrJob !== job || job.generation !== authGeneration) return;
+        cancelHistoryBackfill("登录态已更换，已停止历史回补");
+        if (await acceptCredential(value, job.generation)) {
+            qrJob = null;
+            postQr("success", "登录成功，凭据已保存到 macOS 钥匙串");
+        }
+    } catch (e) {
+        if (qrJob !== job || job.generation !== authGeneration) return;
+        qrJob = null;
+        postQr("error", "扫码验证失败，可刷新二维码或粘贴 Cookie");
+        setAuthState("error", authErrorMessage(e));
+    }
+}
+
+// IINA logs exec argv, so the one-time ticket must stay in a private config.
+// No SESSDATA is ever written to this file. Redirects are allowlisted per hop.
+let nextAuthTempId = 0;
+async function exchangeQrTicket(url, isStale) {
+    const stale = isStale || (() => false);
+    if (typeof url !== "string" || url.length > 4096 || /[\s"'<>\\]/.test(url)) throw { invalidTicket: true };
+    if (/^https:\/\/(?:www\.bilibili\.com|passport\.bilibili\.com)\//.test(url)) {
+        const old = /[?&]SESSDATA=([^&#]*)/i.exec(url);
+        if (old) {
+            const value = sanitizeSessdata(decodeURIComponent(old[1]));
+            if (value) return value;
+        }
+    }
+    for (let hop = 0; hop < 3; hop += 1) {
+        if (stale()) throw { cancelled: true };
+        if (!/^https:\/\/(?:passport\.biligame\.com|passport\.bilibili\.com)\/x\/passport-login\/web\/crossDomain\?[A-Za-z0-9%&=_+.~-]+$/.test(url) ||
+            !/[?&]ticket=[^&]+/.test(url)) throw { invalidTicket: true };
+        const directory = "@tmp/bili-auth-" + Date.now() + "-" + (++nextAuthTempId) + "-" + Math.random().toString(36).slice(2);
+        const config = directory + "/curl.conf";
+        let madeDirectory = false;
+        try {
+            const created = await utils.exec("/bin/mkdir", ["-m", "700", utils.resolvePath(directory)]);
+            if (!created || created.status !== 0) throw { authTemp: true };
+            madeDirectory = true;
+            if (stale()) throw { cancelled: true };
+            file.write(config, 'url = "' + url + '"\n');
+            const mode = await utils.exec("/bin/chmod", ["600", utils.resolvePath(config)]);
+            if (!mode || mode.status !== 0) throw { authTemp: true };
+            if (stale()) throw { cancelled: true };
+            const result = await utils.exec("/usr/bin/curl", ["-q", "--config", utils.resolvePath(config),
+                "--silent", "--show-error", "--proto", "=https", "--max-time", "15", "--max-redirs", "0",
+                "--user-agent", BILI_HEADERS["User-Agent"], "--referer", BILI_HEADERS.Referer,
+                "--dump-header", "-", "--output", "/dev/null"]);
+            if (stale()) throw { cancelled: true };
+            if (!result || result.status !== 0 || typeof result.stdout !== "string") throw { ticketRequest: true };
+            const headers = result.stdout;
+            const statusMatches = Array.from(headers.matchAll(/(?:^|\n)HTTP\/\S+\s+(\d{3})/g));
+            const status = statusMatches.length ? Number(statusMatches[statusMatches.length - 1][1]) : 0;
+            if (status < 200 || status >= 400) throw { status: status };
+            const cookie = /(?:^|\n)set-cookie:\s*SESSDATA=([^;\r\n]*)/i.exec(headers);
+            if (cookie) {
+                const value = sanitizeSessdata(cookie[1]);
+                if (value) return value;
+            }
+            const location = /(?:^|\n)location:\s*([^\r\n]+)/i.exec(headers);
+            if (status >= 300 && location) {
+                url = location[1].trim();
+                continue;
+            }
+            throw { missingCredential: true };
+        } finally {
+            if (madeDirectory) {
+                try { file.delete(config); } catch (e) { /* best-effort */ }
+                try { file.delete(directory); } catch (e) { /* best-effort */ }
+            }
+        }
+    }
+    throw { ticketRedirects: true };
+}
+
+async function logout() {
+    cancelQrLogin(false);
+    cancelHistoryBackfill("已退出登录，保留当前弹幕");
+    postQr("cancelled", "已退出登录");
+    const generation = ++authGeneration;
+    sessdata = "";
+    accountInfo = null;
+    const hadLegacyPreference = Boolean(legacySessdata);
+    if (hadLegacyPreference) legacyPreferencePendingClear = true;
+    if (!saveSettings() && hadLegacyPreference) {
+        setAuthState("error", "退出未完成：旧版设置中的 SESSDATA 未能清除；请重试退出登录");
+        return;
+    }
+    const previousDeletion = credentialDeletion;
+    const deletion = (async () => {
+        if (previousDeletion) await previousDeletion;
+        return await utils.exec("/usr/bin/security", ["delete-generic-password", "-s",
+            "cn.waterflames.iina-bilibili-danmaku - " + AUTH_SERVICE, "-a", AUTH_ACCOUNT]);
+    })();
+    credentialDeletion = deletion;
+    try {
+        const result = await deletion;
+        if (!result || (result.status !== 0 && result.status !== 44)) throw { keychain: true };
+        credentialStored = false;
+        if (generation === authGeneration) setAuthState("anonymous", "已退出 · 未登录，当前使用匿名模式");
+    } catch (e) {
+        credentialStored = true;
+        if (generation === authGeneration) setAuthState("error", "已切换匿名模式，但钥匙串删除失败；请在钥匙串访问中删除插件登录项");
+    } finally {
+        if (credentialDeletion === deletion) credentialDeletion = null;
+    }
 }
 
 loadSettings();
@@ -904,14 +1259,26 @@ async function biliDanmakuXml(cid) {
     const headers = Object.assign({}, BILI_HEADERS);
     // The danmaku endpoint is semi-anonymous: paid/restricted episodes need a
     // logged-in cookie, so attach the user's own SESSDATA only when configured.
-    if (settings.sessdata) {
-        headers.Cookie = "SESSDATA=" + settings.sessdata;
+    if (sessdata) {
+        headers.Cookie = "SESSDATA=" + sessdata;
     }
-    const res = await http.get("https://api.bilibili.com/x/v1/dm/list.so", {
+    const request = () => http.get("https://api.bilibili.com/x/v1/dm/list.so", {
         params: { oid: String(cid) },
         headers: headers,
         data: {}
     });
+    let res;
+    try { res = await request(); }
+    catch (e) {
+        if (!headers.Cookie) throw e;
+        delete headers.Cookie;
+        res = await request();
+    }
+    if (headers.Cookie && res.statusCode !== 412 && res.statusCode !== 429 &&
+        (res.statusCode !== 200 || !/<i(?:\s|>)/.test(res.text || ""))) {
+        delete headers.Cookie;
+        res = await request();
+    }
     if (res.statusCode === 403) {
         throw { network: true, status: res.statusCode, loginRequired: true };
     }
@@ -1150,8 +1517,8 @@ async function downloadDanmakuSegment(cid, index, headers) {
 async function enhanceDanmakuWithSegments(cid, xml) {
     try {
         const headers = Object.assign({}, BILI_HEADERS);
-        if (settings.sessdata) {
-            headers.Cookie = "SESSDATA=" + settings.sessdata;
+        if (sessdata) {
+            headers.Cookie = "SESSDATA=" + sessdata;
         }
         const duration = mpv.getNumber("duration");
         const bounded = isFinite(duration) && duration > 0;
@@ -1181,6 +1548,177 @@ async function enhanceDanmakuWithSegments(cid, xml) {
         console.log(TAG + " segment enhance skipped: " + (e && e.message ? e.message : e));
         return xml;
     }
+}
+
+// Daily responses are overlapping historical pools, not a guaranteed full archive.
+const HISTORY_REQUEST_LIMIT = 400;
+const HISTORY_MONTH_LIMIT = 24;
+const HISTORY_UNKNOWN_MONTHS = 3;
+
+function historyMonthPlan(published, now) {
+    const today = new Date(now + 8 * 3600000);
+    const yesterday = new Date(today.getTime() - 86400000);
+    const lastDate = yesterday.toISOString().slice(0, 10);
+    const current = today.getUTCFullYear() * 12 + today.getUTCMonth();
+    let publication = Number(published);
+    if (!Number.isFinite(publication) && typeof published === "string") {
+        publication = Date.parse(published.replace(" ", "T") + (/Z$|[+-]\d\d:\d\d$/.test(published) ? "" : "+08:00")) / 1000;
+    }
+    const known = Number.isFinite(publication) && publication >= 1230768000 && publication * 1000 <= now;
+    const start = known ? new Date(publication * 1000 + 8 * 3600000) : null;
+    const first = known ? start.getUTCFullYear() * 12 + start.getUTCMonth() : current - HISTORY_UNKNOWN_MONTHS + 1;
+    const count = Math.min(current - first + 1, HISTORY_MONTH_LIMIT);
+    const months = [];
+    for (let i = 0; i < count; i += 1) {
+        const month = current - i;
+        months.push(Math.floor(month / 12) + "-" + String(month % 12 + 1).padStart(2, "0"));
+    }
+    return { months: months, lastDate: lastDate, limited: !known || current - first + 1 > HISTORY_MONTH_LIMIT };
+}
+
+function historyCurrent(job) {
+    return historyJob === job && job.authGeneration === authGeneration && Boolean(sessdata) && isCurrentLoad(job.loadState);
+}
+
+function historyWait(job) {
+    return new Promise((resolve) => {
+        job.wake = resolve;
+        job.timer = setTimeout(() => { job.wake = null; resolve(); }, 1000);
+    });
+}
+
+function reportHistory(job, active, text) {
+    historyProgress = { active: active, text: text, completed: job.completed, total: job.total, added: job.added };
+    sidebar.postMessage("history-progress", historyProgress);
+}
+
+function cancelHistoryBackfill(text, keepPartial) {
+    const job = historyJob;
+    if (!job) return;
+    if (keepPartial !== false && historyCurrent(job) && job.added && job.onMerge) job.onMerge(job.xml);
+    historyJob = null;
+    clearTimeout(job.timer);
+    if (job.wake) { job.wake(); job.wake = null; }
+    reportHistory(job, false, text || "历史回补已停止");
+}
+
+// Validate every protobuf field boundary before using the lenient current-pool parser.
+function validProtoMessage(bytes, start, end, nested) {
+    let offset = start;
+    function varint() {
+        const initial = offset;
+        while (offset < end && offset - initial < 10) {
+            if ((bytes[offset++] & 128) === 0) return true;
+        }
+        return false;
+    }
+    while (offset < end) {
+        const begin = offset;
+        if (!varint()) return false;
+        const key = readProtobufVarint(bytes, begin).value;
+        const wire = key % 8;
+        if (Math.floor(key / 8) === 0) return false;
+        if (wire === 0) { if (!varint()) return false; }
+        else if (wire === 1) offset += 8;
+        else if (wire === 5) offset += 4;
+        else if (wire === 2) {
+            const from = offset;
+            if (!varint()) return false;
+            const length = readProtobufVarint(bytes, from).value;
+            if (!Number.isSafeInteger(length) || offset + length > end) return false;
+            if (nested && Math.floor(key / 8) === 1 && !validProtoMessage(bytes, offset, offset + length, false)) return false;
+            offset += length;
+        } else return false;
+        if (offset > end) return false;
+    }
+    return offset === end;
+}
+
+let nextHistoryFileId = 0;
+async function downloadHistoryDay(cid, date, credential) {
+    const destination = "@tmp/bili-history-" + Date.now() + "-" + (++nextHistoryFileId) + ".so";
+    try {
+        await http.download("https://api.bilibili.com/x/v2/dm/web/history/seg.so", destination, {
+            params: { type: "1", oid: String(cid), date: date },
+            headers: Object.assign({}, BILI_HEADERS, { Cookie: "SESSDATA=" + credential }), method: "GET"
+        });
+        const handle = file.handle(destination, "read");
+        if (!handle) throw { malformedHistory: true };
+        let bytes;
+        try { bytes = handle.readToEnd(); } finally { handle.close(); }
+        if (!bytes || bytes.length > 16 * 1024 * 1024) throw { malformedHistory: true };
+        const text = decodeUtf8(bytes, 0, Math.min(bytes.length, 2048)).trim();
+        if (text[0] === "{") {
+            let body;
+            try { body = JSON.parse(text); } catch (e) { throw { malformedHistory: true }; }
+            throw { biliCode: body.code, malformedHistory: true };
+        }
+        if (!validProtoMessage(bytes, 0, bytes.length, true)) throw { malformedHistory: true };
+        return parseDanmakuSegment(bytes);
+    } finally {
+        try { file.delete(destination); } catch (e) { /* best-effort cleanup */ }
+    }
+}
+
+async function runHistoryBackfill(cid, baseXml, loadState, published, onMerge) {
+    if (!sessdata || !isCurrentLoad(loadState)) return baseXml;
+    cancelHistoryBackfill("正在加载新的历史来源", false);
+    const plan = historyMonthPlan(published, Date.now());
+    const job = { loadState: loadState, authGeneration: authGeneration, credential: sessdata,
+        xml: baseXml, completed: 0, total: 0, added: 0, requests: 0, timer: null, wake: null, onMerge: onMerge };
+    historyJob = job;
+    let message = "历史补充完成（" + plan.months.length + " 个月范围" + (plan.limited ? "，范围有限" : "") + "，不保证全量）";
+    reportHistory(job, true, "正在查询历史日期；当前弹幕可正常播放");
+    try {
+        for (const month of plan.months) {
+            if (!historyCurrent(job)) return job.xml;
+            if (job.requests >= HISTORY_REQUEST_LIMIT) { message = "已达 400 次回补请求上限，保留已获取结果"; break; }
+            if (job.requests) await historyWait(job);
+            if (!historyCurrent(job)) return job.xml;
+            job.requests += 1;
+            const index = await biliApi("/x/v2/dm/history/index", { type: "1", oid: String(cid), month: month },
+                { Cookie: "SESSDATA=" + job.credential });
+            if (!historyCurrent(job)) return job.xml;
+            if (index !== null && !Array.isArray(index)) throw { malformedHistory: true };
+            const days = Array.from(new Set((index || []).filter((date) => {
+                if (typeof date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(date) || date.slice(0, 7) !== month || date > plan.lastDate) return false;
+                const parsed = new Date(date + "T00:00:00Z");
+                return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === date;
+            }))).sort().reverse();
+            job.total += days.length;
+            for (const date of days) {
+                if (job.requests >= HISTORY_REQUEST_LIMIT) { message = "已达 400 次回补请求上限，保留已获取结果"; break; }
+                await historyWait(job);
+                if (!historyCurrent(job)) return job.xml;
+                reportHistory(job, true, "正在回补 " + date + "；可随时取消");
+                job.requests += 1;
+                const records = await downloadHistoryDay(cid, date, job.credential);
+                if (!historyCurrent(job)) return job.xml;
+                const before = (job.xml.match(/<d p=/g) || []).length;
+                job.xml = mergeDanmakuRecords(job.xml, records);
+                job.added += (job.xml.match(/<d p=/g) || []).length - before;
+                job.completed += 1;
+                reportHistory(job, true, "历史补充进行中；当前弹幕可正常播放");
+            }
+        }
+    } catch (e) {
+        if (!historyCurrent(job)) return job.xml;
+        const status = e && (e.status || e.statusCode);
+        if (e && e.biliCode === -101) {
+            sessdata = "";
+            accountInfo = null;
+            setAuthState("expired", "登录态已失效，已回退匿名模式；请重新登录");
+            message = "登录态失效，历史回补中止，保留已获取结果";
+        } else if (e && (e.biliCode === -412 || status === 412 || status === 429)) {
+            message = "请求受限，历史回补中止，请稍后重试；保留已获取结果";
+        } else message = "历史回补部分完成，网络或响应异常导致中止；保留已获取结果";
+    }
+    if (historyJob === job && isCurrentLoad(loadState) && job.authGeneration === authGeneration) {
+        if (job.added && onMerge) onMerge(job.xml);
+        historyJob = null;
+        reportHistory(job, false, message);
+    }
+    return job.xml;
 }
 
 function reportError(e) {
@@ -1237,6 +1775,10 @@ async function loadPart(index, loadState, streamMetadata) {
     if (!streamMetadata || streamMetadata.origin !== "auto") {
         core.osd("已切换到「" + video.title + "」" + label);
     }
+    if (sessdata) {
+        void runHistoryBackfill(cid, mergedXml, loadState, video.parts[index].published,
+            (updated) => { if (isCurrentLoad(loadState)) pushToOverlay(updated, streamMetadata); });
+    }
 }
 
 async function loadSource(text) {
@@ -1269,7 +1811,7 @@ async function loadBvid(bvid, loadState, streamMetadata, preferredPartIndex) {
             type: "video",
             bvid: bvid,
             title: data.title,
-            parts: data.pages.map((p) => ({ page: p.page, part: p.part, cid: p.cid })),
+            parts: data.pages.map((p) => ({ page: p.page, part: p.part, cid: p.cid, published: data.pubdate })),
             index: 0
         };
         console.log(TAG + " video: " + video.title + " (" + video.parts.length + " parts)");
@@ -1929,7 +2471,8 @@ async function loadSeasonById(seasonId, loadState, epId, streamMetadata, preferr
                 part: e.long_title,
                 cid: e.cid,
                 ep: e.id !== undefined ? e.id : e.ep_id,
-                badge: e.badge
+                badge: e.badge,
+                published: e.pub_time || result.publish && result.publish.pub_time
             })),
             index: -1
         };
@@ -2020,6 +2563,7 @@ function clearCurrentStream() {
 }
 
 function invalidateFileLoads() {
+    cancelHistoryBackfill("文件已切换，历史回补已停止", false);
     searchGeneration += 1;
     pendingSearches.clear();
     video = null;
@@ -2027,6 +2571,7 @@ function invalidateFileLoads() {
 }
 
 function invalidateCurrentLoad() {
+    cancelHistoryBackfill("来源已切换，历史回补已停止", false);
     loadToken += 1;
     searchGeneration += 1;
     pendingSearches.clear();

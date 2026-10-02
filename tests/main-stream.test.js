@@ -109,6 +109,8 @@ function loadMainFixture(options = {}) {
     let danmakuRequestCount = 0;
     const segmentFiles = new Map();
     const downloadRequests = [];
+    const keychainWrites = [];
+    let keychainValue = options.keychain === undefined ? false : options.keychain;
 
     const sidebar = {
         loadFile() {
@@ -179,6 +181,9 @@ function loadMainFixture(options = {}) {
                 danmakuRequestCount += 1;
                 return { statusCode: 200, text: xmls[index] };
             }
+            if (url.includes("/x/web-interface/nav")) {
+                return { statusCode: 200, text: JSON.stringify({ code: 0, data: { isLogin: true } }) };
+            }
             throw new Error("unexpected URL: " + url);
         },
         async download(url, destination, request) {
@@ -194,6 +199,7 @@ function loadMainFixture(options = {}) {
         }
     };
     const file = {
+        write(path, content) { segmentFiles.set(path, content); },
         handle(path, mode) {
             if (mode === "read" && segmentFiles.has(path)) {
                 return {
@@ -248,7 +254,9 @@ function loadMainFixture(options = {}) {
     }
     const context = {
         console,
-        Date: { now: () => clock.now },
+        Date: class extends Date {
+            static now() { return options.now === undefined ? clock.now : options.now + clock.now; }
+        },
         setTimeout,
         clearTimeout,
         iina: {
@@ -271,12 +279,21 @@ function loadMainFixture(options = {}) {
                     return Object.prototype.hasOwnProperty.call(prefsStore, key) ? prefsStore[key] : null;
                 },
                 set(key, value) {
+                    if (options.preferencesSetFails) throw new Error("simulated preferences write failure");
                     prefsStore[key] = value;
                     if (key === "settings") savedSettings = value;
                 },
                 sync() { preferenceSyncCalls += 1; }
             },
             utils: {
+                resolvePath(path) { return path.replace("@tmp", "/private/tmp/iina-plugin-test"); },
+                keychainRead() { return keychainValue; },
+                keychainWrite(service, name, value) {
+                    keychainWrites.push({ service, name, value });
+                    if (options.keychainWriteFails) return false;
+                    keychainValue = value;
+                    return true;
+                },
                 exec(command, args) {
                     if (options.utilsExec) {
                         return options.utilsExec(command, args);
@@ -302,6 +319,8 @@ function loadMainFixture(options = {}) {
         context,
         downloadRequests,
         segmentFiles,
+        keychainWrites,
+        get keychainValue() { return keychainValue; },
         get mpvPosition() { return mpvPosition; },
         set mpvPosition(value) { mpvPosition = value; },
         simulateOverlayReload() { overlayPageReady = false; },
@@ -315,6 +334,7 @@ function loadMainFixture(options = {}) {
         get savedSettings() { return savedSettings; },
         get preferenceSyncCalls() { return preferenceSyncCalls; },
         get prefs() { return prefsStore; },
+        setPreferenceWritesFail(value) { options.preferencesSetFails = value; },
         normalizeMediaTitle: context.normalizeMediaTitle,
         parseMediaFilename: context.parseMediaFilename,
         currentFileContext: context.currentFileContext,
@@ -1445,7 +1465,7 @@ test("drops a stale video detail response after the file changes", async () => {
     assert.deepEqual(fixture.osdMessages, []);
 });
 
-test("sends the logged-in cookie only with danmaku requests", async () => {
+test("verified login is attached to danmaku but not video info or overlay messages", async () => {
     const sessdata = "abc123%2C1700000000%2Cxyz789";
     const seen = [];
     const fixture = loadMainFixture({
@@ -1455,6 +1475,7 @@ test("sends the logged-in cookie only with danmaku requests", async () => {
             return undefined;
         }
     });
+    await wait(0); // Startup credentials are activated only after nav validation.
     await fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
     await wait(0);
 
@@ -2414,7 +2435,7 @@ test("normalizes saved settings types, ranges and unknown keys", () => {
         enabled: true, showTop: false, showBottom: true, fontSize: 36,
         opacity: 0, speed: 1200, offset: -30, fontFamily: "toString",
         strokeColor: "#000000", strokeWidth: 3,
-        autoLoadBangumi: false, autoLoadVideo: false, sessdata: ""
+        autoLoadBangumi: false, autoLoadVideo: false
     });
     assert.ok(fixture.savedSettings, "stale stored values trigger migration write-back");
     assert.equal(fixture.savedSettings.fontSize, 36);
@@ -2444,12 +2465,15 @@ test("normalizes saved settings types, ranges and unknown keys", () => {
     }
 });
 
-test("normalizes the stored login cookie", () => {
+test("migrates the stored login cookie to Keychain without broadcasting it", () => {
     const valid = "abc123%2C1700000000%2Cxyz789";
-    const settings = currentSettings(loadMainFixture({
+    const fixture = loadMainFixture({
         settings: { sessdata: "  " + valid + "  " }
-    }));
-    assert.equal(settings.sessdata, valid, "trimmed credential is kept");
+    });
+    assert.equal(fixture.keychainValue, valid);
+    assert.equal("sessdata" in fixture.savedSettings, false);
+    assert.equal("sessdata" in currentSettings(fixture), false);
+    assert.ok(!JSON.stringify(fixture.sidebarMessages).includes(valid));
 });
 
 test("rejects malformed login cookies instead of persisting them raw", () => {
@@ -2459,21 +2483,22 @@ test("rejects malformed login cookies instead of persisting them raw", () => {
         "a".repeat(301)
     ]) {
         const normalized = currentSettings(loadMainFixture({ settings: { sessdata: invalid } }));
-        assert.equal(normalized.sessdata, "", JSON.stringify(invalid));
+        assert.equal("sessdata" in normalized, false, JSON.stringify(invalid));
     }
-    const trimmed = currentSettings(loadMainFixture({
+    const trimmed = loadMainFixture({
         settings: { sessdata: "  abc123%2C1700000000%2Cxyz789  " }
-    }));
-    assert.equal(trimmed.sessdata, "abc123%2C1700000000%2Cxyz789");
+    });
+    assert.equal(trimmed.keychainValue, "abc123%2C1700000000%2Cxyz789");
 });
 
-test("clears the stored login cookie when a patch submits an empty value", () => {
+test("ordinary settings patches cannot change credentials", () => {
     const fixture = loadMainFixture({
         settings: { sessdata: "abc123%2C1700000000%2Cxyz789" }
     });
     fixture.sidebarHandlers["update-settings"]({ patch: { sessdata: "" } });
-    assert.equal(fixture.savedSettings.sessdata, "");
-    assert.equal(currentSettings(fixture).sessdata, "");
+    assert.equal("sessdata" in fixture.savedSettings, false);
+    assert.equal(fixture.keychainValue, "abc123%2C1700000000%2Cxyz789");
+    assert.equal("sessdata" in currentSettings(fixture), false);
 });
 
 test("normalizes patches before persisting and restoring settings", () => {
@@ -2549,7 +2574,7 @@ test("migrates full default settings when nothing was stored yet", () => {
         enabled: true, showTop: true, showBottom: true, fontSize: 25,
         fontFamily: "system", strokeWidth: 1, strokeColor: "#000000",
         opacity: 100, speed: 680, offset: 0,
-        autoLoadBangumi: false, autoLoadVideo: false, sessdata: ""
+        autoLoadBangumi: false, autoLoadVideo: false
     });
     assert.equal(fixture.preferenceSyncCalls, 1);
 });
@@ -2559,7 +2584,7 @@ test("skips the migration save when stored settings are complete and valid", () 
         enabled: true, showTop: true, showBottom: true,
         fontSize: 25, fontFamily: "PingFang SC", strokeWidth: 1.5,
         strokeColor: "#123abc", opacity: 80, speed: 680, offset: 0,
-        autoLoadBangumi: false, autoLoadVideo: false, sessdata: ""
+        autoLoadBangumi: false, autoLoadVideo: false
     };
     const fixture = loadMainFixture({ settings: full });
     assert.equal(fixture.savedSettings, null);

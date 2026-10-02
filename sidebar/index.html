@@ -18,7 +18,9 @@
   .hidden { display: none; }
   .section-title { font-weight: bold; margin: 8px 0 6px; }
   .row { display: flex; gap: 6px; margin: 6px 0; }
-  input[type="text"] {
+  .row.hidden { display: none; }
+  input[type="text"],
+  input[type="password"] {
     width: 100%; box-sizing: border-box; padding: 5px 6px;
     background: #222; color: #eee; border: 1px solid #555; border-radius: 4px;
   }
@@ -40,6 +42,9 @@
   label.opt { display: block; margin: 6px 0; }
   input[type="range"] { width: 100%; }
   .hint { color: #777; margin-top: 10px; }
+  #account-section { margin-top: 12px; border-top: 1px solid #444; padding-top: 4px; }
+  #auth-qr-code { width: 192px; margin: 10px auto; padding: 24px; background: #fff; }
+  #auth-qr-code img, #auth-qr-code canvas { display: block; }
   /* stroke: label on its own line, slider + circular chip share the line below */
   .stroke-ctl { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
   .stroke-ctl input[type="range"] { flex: 1 1 auto; width: auto; }
@@ -135,8 +140,36 @@
     <button class="action" id="clear-btn">清空弹幕</button>
     <button class="action" id="reset-offset-btn">重置偏移</button>
   </div>
+  <section id="account-section" aria-labelledby="account-title">
+    <div class="section-title" id="account-title">③ 账号（可选）</div>
+    <div id="auth-status" class="status" role="status" aria-live="polite">未登录 · 匿名模式</div>
+    <div id="anonymous-impact" class="hint">未登录影响：当前弹幕池可正常加载；无法回补历史弹幕，实际弹幕数可能少于 B 站页面统计。</div>
+    <div id="authenticated-account" class="hidden">
+      <div class="status" id="account-name"></div>
+      <div class="status" id="membership-status"></div>
+    </div>
+    <div class="row">
+      <button class="action" id="auth-qr-start">扫码登录</button>
+      <button class="action" id="auth-logout" disabled>退出登录</button>
+    </div>
+    <div id="auth-qr-area" class="hidden">
+      <div id="auth-qr-code" class="hidden" role="img" aria-label="B 站登录二维码"></div>
+      <div id="auth-qr-status" class="status" role="status" aria-live="polite"></div>
+      <div class="row">
+        <button class="action" id="auth-qr-refresh">刷新二维码</button>
+        <button class="action" id="auth-qr-cancel">取消扫码</button>
+      </div>
+    </div>
+    <label class="opt" for="auth-cookie-input">或粘贴 Cookie / SESSDATA</label>
+    <input type="password" id="auth-cookie-input" placeholder="完整 Cookie 或 SESSDATA 值" autocomplete="off" spellcheck="false">
+    <div class="row"><button class="action" id="auth-cookie-save">保存并验证</button></div>
+    <div class="hint">新登录凭据验证后写入 macOS 钥匙串；旧版 SESSDATA 仅在钥匙串迁移成功后清除，迁移失败会保留旧设置并回退匿名。退出登录会清理旧值并尝试删除钥匙串条目。二维码在本机生成。登录后加载来源可限速补充历史弹幕，但不保证全量。Cookie 可从你自己的浏览器 → 开发者工具 → Application → Cookies 获取。</div>
+    <div id="history-status" class="status" role="status" aria-live="polite">登录后加载来源可回补历史弹幕</div>
+    <div id="history-actions" class="row hidden"><button class="action" id="history-cancel" disabled>取消回补</button></div>
+  </section>
 </div>
 
+<script src="vendor/qrcode.min.js"></script>
 <script>
   // Tab switching is local UI state only.
   document.getElementById("tabbtn-source").onclick = () => switchTab("source");
@@ -428,6 +461,149 @@
     ctl.offset.value = s.offset;
     refreshValueLabels();
   });
+
+  const authStatus = document.getElementById("auth-status");
+  const cookieInput = document.getElementById("auth-cookie-input");
+  const qrArea = document.getElementById("auth-qr-area");
+  const qrCode = document.getElementById("auth-qr-code");
+  const qrStatus = document.getElementById("auth-qr-status");
+  const qrStart = document.getElementById("auth-qr-start");
+  const cookieSave = document.getElementById("auth-cookie-save");
+  const logoutButton = document.getElementById("auth-logout");
+  let qrActive = false;
+  let qrURL = "";
+  qrStart.disabled = false;
+  cookieSave.disabled = false;
+  logoutButton.disabled = true;
+
+  function clearQr() {
+    qrURL = "";
+    qrCode.textContent = "";
+    qrCode.title = "";
+    qrCode.classList.add("hidden");
+  }
+  function startQr() {
+    qrActive = true;
+    clearQr();
+    qrArea.classList.remove("hidden");
+    qrStatus.textContent = "正在生成二维码…";
+    qrStatus.classList.remove("error");
+    iina.postMessage("auth-qr-start", {});
+  }
+  function cancelQr() {
+    qrActive = false;
+    clearQr();
+    qrArea.classList.add("hidden");
+    iina.postMessage("auth-qr-cancel", {});
+  }
+  qrStart.onclick = startQr;
+  document.getElementById("auth-qr-refresh").onclick = startQr;
+  document.getElementById("auth-qr-cancel").onclick = cancelQr;
+  function saveCookie() {
+    const cookie = cookieInput.value;
+    if (!cookie.trim()) {
+      authStatus.textContent = "请先粘贴 Cookie 或 SESSDATA";
+      authStatus.classList.add("error");
+      return;
+    }
+    qrActive = false;
+    clearQr();
+    qrArea.classList.add("hidden");
+    cookieInput.value = "";
+    authStatus.textContent = "正在验证 Cookie…";
+    authStatus.classList.remove("error");
+    iina.postMessage("auth-cookie", { cookie: cookie });
+  }
+  cookieSave.onclick = saveCookie;
+  cookieInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !cookieSave.disabled) { e.preventDefault(); saveCookie(); }
+  });
+  logoutButton.onclick = () => {
+    qrActive = false;
+    clearQr();
+    qrArea.classList.add("hidden");
+    cookieInput.value = "";
+    iina.postMessage("auth-logout", {});
+  };
+  iina.onMessage("auth-state", (data) => {
+    if (!data) return;
+    authStatus.textContent = data.message || (data.loggedIn ? "已登录" : "匿名模式");
+    authStatus.classList.toggle("error", data.status === "error" || data.status === "expired");
+    qrStart.disabled = data.status === "checking";
+    cookieSave.disabled = data.status === "checking";
+    logoutButton.disabled = !data.loggedIn && !data.canLogout;
+    const loggedIn = data.loggedIn === true;
+    document.getElementById("anonymous-impact").classList.toggle("hidden", loggedIn);
+    const accountPanel = document.getElementById("authenticated-account");
+    accountPanel.classList.toggle("hidden", !loggedIn);
+    if (!loggedIn) return;
+    const account = data.account || {};
+    document.getElementById("account-name").textContent = "当前账号：" +
+      (typeof account.uname === "string" && account.uname ? account.uname : "B 站用户");
+    const membership = document.getElementById("membership-status");
+    if (account.vipStatus === 1) {
+      const type = account.vipLabel || (account.vipType === 2 ? "年度大会员" :
+        account.vipType === 1 ? "月度大会员" : "已开通大会员");
+      let expires = "";
+      const due = Number(account.vipDueDate);
+      if (Number.isFinite(due) && due > 0) {
+        const date = new Date(due);
+        if (Number.isFinite(date.getTime())) {
+          expires = " · 有效至 " + date.getFullYear() + "-" +
+            String(date.getMonth() + 1).padStart(2, "0") + "-" + String(date.getDate()).padStart(2, "0");
+        }
+      }
+      membership.textContent = "大会员：" + type + expires;
+    } else if (account.vipStatus === 0) {
+      membership.textContent = "大会员：未开通大会员";
+    } else {
+      membership.textContent = "大会员：状态暂不可用";
+    }
+  });
+  iina.onMessage("auth-qr", (data) => {
+    if (!data) return;
+    const terminal = ["expired", "error", "success", "cancelled"].indexOf(data.status) >= 0;
+    if (terminal) {
+      qrActive = false;
+      clearQr();
+      qrArea.classList.toggle("hidden", data.status === "success" || data.status === "cancelled");
+      qrStatus.textContent = data.message || "扫码已结束";
+      qrStatus.classList.toggle("error", data.status === "expired" || data.status === "error");
+      return;
+    }
+    if (!qrActive) return;
+    qrArea.classList.remove("hidden");
+    qrStatus.textContent = data.message || "等待扫码…";
+    qrStatus.classList.remove("error");
+    if (data.status === "loading") clearQr();
+    if (data.url && data.url !== qrURL) {
+      clearQr();
+      try {
+        new QRCode(qrCode, { text: data.url, width: 192, height: 192, correctLevel: QRCode.CorrectLevel.M });
+        qrURL = data.url;
+        qrCode.classList.remove("hidden");
+      } catch (e) {
+        clearQr();
+        qrStatus.textContent = "二维码生成失败，请刷新或使用 Cookie 登录";
+        qrStatus.classList.add("error");
+      }
+    }
+  });
+  const historyCancel = document.getElementById("history-cancel");
+  const historyStatus = document.getElementById("history-status");
+  historyCancel.disabled = true;
+  iina.onMessage("history-progress", (data) => {
+    if (!data) return;
+    historyStatus.textContent = (data.text || "历史补充") + " · " + (data.completed || 0) + "/" +
+      (data.total || 0) + " 天 · 新增 " + (data.added || 0) + " 条";
+    historyCancel.disabled = !data.active;
+    document.getElementById("history-actions").classList.toggle("hidden", !data.active);
+  });
+  historyCancel.onclick = () => {
+    historyCancel.disabled = true;
+    historyStatus.textContent = "正在取消回补…";
+    iina.postMessage("history-cancel", {});
+  };
 
   // Font combo (custom dropdown; WKWebView does not render datalist).
   // Performance: option nodes are built once per font-list via a single
