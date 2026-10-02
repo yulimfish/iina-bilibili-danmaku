@@ -1573,6 +1573,29 @@ function pageNumberOf(page) {
     return null;
 }
 
+// Some seasons list a short "预告" stub of an episode next to the full episode
+// under the same number. Prefer the full entry so the sidebar list and
+// automatic matching never resolve to the trailer's near-empty danmaku pool.
+function isPreviewEpisode(episode) {
+    return Boolean(episode) && typeof episode.badge === "string" &&
+        episode.badge.indexOf("预告") >= 0;
+}
+
+function preferFullEpisodes(episodes) {
+    const list = Array.isArray(episodes) ? episodes.slice() : [];
+    const fullNumbers = new Set();
+    list.forEach((episode) => {
+        if (!isPreviewEpisode(episode)) {
+            const number = episodeNumberOf(episode);
+            if (number !== null) {
+                fullNumbers.add(number);
+            }
+        }
+    });
+    return list.filter((episode) => !isPreviewEpisode(episode) ||
+        !fullNumbers.has(episodeNumberOf(episode)));
+}
+
 function rankCandidates(context, candidates) {
     const source = Array.isArray(candidates) ? candidates : [];
     const title = context && context.title;
@@ -1632,7 +1655,7 @@ async function fetchCandidateDetails(candidate, isStale) {
         });
         return Object.assign({}, candidate, {
             detailTitle: stripSearchMarkup(result.title || candidate.title),
-            episodes: episodes.map(normalizeCandidateEpisode)
+            episodes: preferFullEpisodes(episodes).map(normalizeCandidateEpisode)
         });
     }
     result = await biliApi("/x/web-interface/view", { bvid: candidate.bvid }, null, isStale);
@@ -1888,12 +1911,13 @@ async function loadSeasonById(seasonId, loadState, epId, streamMetadata, preferr
         if (!isCurrentLoad(loadState)) {
             return;
         }
-        const episodes = (result.episodes || []).slice();
+        const merged = (result.episodes || []).slice();
         (result.section || []).forEach((section) => {
             if (section && Array.isArray(section.episodes)) {
-                episodes.push(...section.episodes);
+                merged.push(...section.episodes);
             }
         });
+        const episodes = preferFullEpisodes(merged);
         if (!episodes.length) {
             throw { biliCode: -404, biliMessage: "该剧集无可播分集（可能地区受限）" };
         }
@@ -1911,8 +1935,18 @@ async function loadSeasonById(seasonId, loadState, epId, streamMetadata, preferr
         };
         console.log(TAG + " season: " + video.title + " (" + video.parts.length + " episodes)");
         if (epId) {
-            // Direct ep link: jump straight to that episode.
+            // Direct ep link: jump straight to that episode. When the link
+            // points at a "预告" stub that lost its slot to the full episode,
+            // fall back to the full episode with the same number.
             let idx = video.parts.findIndex((p) => String(p.ep) === String(epId));
+            if (idx < 0) {
+                const requested = merged.find((e) =>
+                    String(e.id !== undefined ? e.id : e.ep_id) === String(epId));
+                const number = requested ? episodeNumberOf(requested) : null;
+                if (number !== null) {
+                    idx = video.parts.findIndex((p) => episodeNumberOf(p) === number);
+                }
+            }
             if (idx < 0) {
                 sidebar.postMessage("error", { message: "目标分集不在当前剧集列表中" });
                 return;

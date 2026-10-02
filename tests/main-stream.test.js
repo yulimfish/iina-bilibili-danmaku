@@ -1859,6 +1859,195 @@ test("loads a direct ep link from a season section instead of the first main epi
     assert.equal(videos.at(-1).data.current, 1);
 });
 
+// Bilibili lists a short "预告" stub of an upcoming episode alongside the
+// full episode under the same number (observed on season 73957). Prefer the
+// full entry in the list, otherwise users pick the trailer and its near-empty
+// danmaku pool looks like "no danmaku".
+test("lists the full episode instead of its preview duplicate", async () => {
+    const requestedOids = [];
+    const fixture = loadMainFixture({
+        httpGet(url, request) {
+            if (url.includes("/pgc/view/web/season")) {
+                return {
+                    statusCode: 200,
+                    text: JSON.stringify({ code: 0, result: {
+                        title: "Demo Season",
+                        episodes: [
+                            { id: 11, cid: 111, title: "1", long_title: "E1", badge: "" },
+                            { id: 22, cid: 222, title: "2", long_title: "E2", badge: "预告", section_type: 1 },
+                            { id: 23, cid: 223, title: "2", long_title: "E2", badge: "会员", section_type: 0 }
+                        ],
+                        section: []
+                    } })
+                };
+            }
+            if (url.includes("/x/v1/dm/list.so")) {
+                requestedOids.push(request.params.oid);
+                return { statusCode: 200, text: "<i></i>" };
+            }
+            return undefined;
+        }
+    });
+
+    await fixture.sidebarHandlers["load-source"]({
+        text: "https://www.bilibili.com/bangumi/play/ss73957"
+    });
+    await wait(0);
+
+    const video = fixture.sidebarMessages.filter((message) => message.name === "video").at(-1);
+    assert.deepEqual(JSON.parse(JSON.stringify(video.data.parts.map((part) => part.page))), ["1", "2"]);
+    await fixture.sidebarHandlers["select-part"]({ index: 1 });
+    await wait(0);
+    assert.deepEqual(requestedOids, ["223"]);
+});
+
+test("auto-loads the full episode when a preview duplicate shares its number", async () => {
+    const requestedOids = [];
+    const fixture = loadMainFixture({
+        settings: { autoLoadBangumi: true },
+        httpGet(url, request) {
+            if (url.includes("/x/web-interface/search/type")) {
+                if (request.params.search_type === "video") {
+                    return sourceSearchResponse([]);
+                }
+                return sourceSearchResponse([{ season_id: 1, title: "Show", pubtime: 0 }]);
+            }
+            if (url.includes("/pgc/view/web/season")) {
+                return {
+                    statusCode: 200,
+                    text: JSON.stringify({ code: 0, result: {
+                        title: "Show",
+                        episodes: [
+                            { id: 22, cid: 222, title: "2", long_title: "E2", badge: "预告", section_type: 1 },
+                            { id: 23, cid: 223, title: "2", long_title: "E2", badge: "会员", section_type: 0 }
+                        ],
+                        section: []
+                    } })
+                };
+            }
+            if (url.includes("/x/v1/dm/list.so")) {
+                requestedOids.push(request.params.oid);
+                return { statusCode: 200, text: "<i></i>" };
+            }
+            return undefined;
+        }
+    });
+
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/Show.S02E02.mkv");
+    await wait(20);
+
+    const stream = fixture.overlayMessages.find((message) => message.name === "stream-start");
+    assert.ok(stream, "the full episode should be auto-loaded, not treated as ambiguous");
+    assert.equal(stream.data.metadata.partLabel, "第2集");
+    assert.deepEqual(requestedOids, ["223"]);
+});
+
+test("falls back to the full episode for a direct preview ep link", async () => {
+    const requestedOids = [];
+    const fixture = loadMainFixture({
+        httpGet(url, request) {
+            if (url.includes("/pgc/view/web/season")) {
+                return {
+                    statusCode: 200,
+                    text: JSON.stringify({ code: 0, result: {
+                        title: "Demo Season",
+                        episodes: [
+                            { id: 11, cid: 111, title: "1", long_title: "E1", badge: "" },
+                            { id: 22, cid: 222, title: "2", long_title: "E2", badge: "预告", section_type: 1 },
+                            { id: 23, cid: 223, title: "2", long_title: "E2", badge: "会员", section_type: 0 }
+                        ],
+                        section: []
+                    } })
+                };
+            }
+            if (url.includes("/x/v1/dm/list.so")) {
+                requestedOids.push(request.params.oid);
+                return { statusCode: 200, text: "<i></i>" };
+            }
+            return undefined;
+        }
+    });
+
+    await fixture.sidebarHandlers["load-source"]({
+        text: "https://www.bilibili.com/bangumi/play/ep22"
+    });
+    await wait(0);
+
+    assert.deepEqual(requestedOids, ["223"], "preview link resolves to its full episode");
+});
+
+test("keeps a preview stub when no full episode shares its number", async () => {
+    const requestedOids = [];
+    const fixture = loadMainFixture({
+        httpGet(url, request) {
+            if (url.includes("/pgc/view/web/season")) {
+                return {
+                    statusCode: 200,
+                    text: JSON.stringify({ code: 0, result: {
+                        title: "Demo Season",
+                        episodes: [
+                            { id: 22, cid: 222, title: "2", long_title: "E2", badge: "预告", section_type: 1 }
+                        ],
+                        section: []
+                    } })
+                };
+            }
+            if (url.includes("/x/v1/dm/list.so")) {
+                requestedOids.push(request.params.oid);
+                return { statusCode: 200, text: "<i></i>" };
+            }
+            return undefined;
+        }
+    });
+
+    await fixture.sidebarHandlers["load-source"]({
+        text: "https://www.bilibili.com/bangumi/play/ss73957"
+    });
+    await wait(0);
+
+    const video = fixture.sidebarMessages.filter((message) => message.name === "video").at(-1);
+    assert.deepEqual(JSON.parse(JSON.stringify(video.data.parts.map((part) => part.page))), ["2"]);
+    assert.deepEqual(requestedOids, ["222"]);
+});
+
+test("deduplicates a preview stub that arrives from a season section", async () => {
+    const requestedOids = [];
+    const fixture = loadMainFixture({
+        httpGet(url, request) {
+            if (url.includes("/pgc/view/web/season")) {
+                return {
+                    statusCode: 200,
+                    text: JSON.stringify({ code: 0, result: {
+                        title: "Demo Season",
+                        episodes: [
+                            { id: 23, cid: 223, title: "2", long_title: "E2", badge: "会员", section_type: 0 }
+                        ],
+                        section: [{ episodes: [
+                            { id: 22, cid: 222, title: "2", long_title: "E2", badge: "预告", section_type: 1 }
+                        ] }]
+                    } })
+                };
+            }
+            if (url.includes("/x/v1/dm/list.so")) {
+                requestedOids.push(request.params.oid);
+                return { statusCode: 200, text: "<i></i>" };
+            }
+            return undefined;
+        }
+    });
+
+    await fixture.sidebarHandlers["load-source"]({
+        text: "https://www.bilibili.com/bangumi/play/ss73957"
+    });
+    await wait(0);
+
+    const video = fixture.sidebarMessages.filter((message) => message.name === "video").at(-1);
+    assert.deepEqual(JSON.parse(JSON.stringify(video.data.parts.map((part) => part.page))), ["2"]);
+    await fixture.sidebarHandlers["select-part"]({ index: 0 });
+    await wait(0);
+    assert.deepEqual(requestedOids, ["223"]);
+});
+
 test("rejects a direct ep link when the requested episode is absent", async () => {
     let danmakuRequests = 0;
     const fixture = loadMainFixture({
