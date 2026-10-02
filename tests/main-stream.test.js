@@ -3,6 +3,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { createStreamingParser } = require("../overlay/danmaku-parser.js");
 
 function wait(milliseconds = 0) {
     return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -38,6 +39,54 @@ function seasonDetailResponse(title, episodes) {
     };
 }
 
+function protoVarint(value) {
+    const bytes = [];
+    let rest = value;
+    while (rest >= 0x80) {
+        bytes.push((rest & 0x7f) | 0x80);
+        rest = Math.floor(rest / 128);
+    }
+    bytes.push(rest);
+    return bytes;
+}
+
+function protoVarintField(field, value) {
+    return protoVarint((field << 3) | 0).concat(protoVarint(value));
+}
+
+function protoBytesField(field, bytes) {
+    return protoVarint((field << 3) | 2).concat(protoVarint(bytes.length), bytes);
+}
+
+function protoUtf8(text) {
+    return Array.from(Buffer.from(text, "utf8"));
+}
+
+function danmakuSegmentBytes(elements) {
+    const payload = [];
+    elements.forEach((element) => {
+        const body = [];
+        if (element.progress !== undefined) body.push(...protoVarintField(2, element.progress));
+        if (element.mode !== undefined) body.push(...protoVarintField(3, element.mode));
+        if (element.fontsize !== undefined) body.push(...protoVarintField(4, element.fontsize));
+        if (element.color !== undefined) body.push(...protoVarintField(5, element.color));
+        if (element.midHash !== undefined) body.push(...protoBytesField(6, protoUtf8(element.midHash)));
+        if (element.content !== undefined) body.push(...protoBytesField(7, protoUtf8(element.content)));
+        if (element.ctime !== undefined) body.push(...protoVarintField(8, element.ctime));
+        if (element.pool !== undefined) body.push(...protoVarintField(11, element.pool));
+        if (element.idStr !== undefined) body.push(...protoBytesField(12, protoUtf8(element.idStr)));
+        payload.push(...protoBytesField(1, body));
+    });
+    return Uint8Array.from(payload);
+}
+
+function mergedChunks(fixture) {
+    return fixture.overlayMessages
+        .filter((message) => message.name === "stream-chunk")
+        .map((message) => message.data.chunk)
+        .join("");
+}
+
 function loadMainFixture(options = {}) {
     const eventHandlers = {};
     const sidebarHandlers = {};
@@ -57,6 +106,8 @@ function loadMainFixture(options = {}) {
     const xmls = options.xmls || [defaultXml];
     let videoRequestCount = 0;
     let danmakuRequestCount = 0;
+    const segmentFiles = new Map();
+    const downloadRequests = [];
 
     const sidebar = {
         loadFile() {
@@ -127,7 +178,36 @@ function loadMainFixture(options = {}) {
                 return { statusCode: 200, text: xmls[index] };
             }
             throw new Error("unexpected URL: " + url);
+        },
+        async download(url, destination, request) {
+            const record = { url, destination, request };
+            downloadRequests.push(record);
+            if (options.httpDownload) {
+                const bytes = await options.httpDownload(url, destination, request);
+                segmentFiles.set(destination, bytes === undefined
+                    ? new Uint8Array(0) : bytes);
+                return;
+            }
+            segmentFiles.set(destination, new Uint8Array(0));
         }
+    };
+    const file = {
+        handle(path, mode) {
+            if (mode === "read" && segmentFiles.has(path)) {
+                return {
+                    readToEnd() { return segmentFiles.get(path); },
+                    close() {}
+                };
+            }
+            if (mode === "write") {
+                return {
+                    write() {},
+                    close() {}
+                };
+            }
+            return null;
+        },
+        delete(path) { segmentFiles.delete(path); }
     };
     const core = {
         window: { loaded: options.windowLoadedInitially !== false },
@@ -143,7 +223,11 @@ function loadMainFixture(options = {}) {
     };
     const mpv = {
         getNumber(name) {
-            return name === "time-pos" ? mpvPosition : NaN;
+            if (name === "time-pos") return mpvPosition;
+            if (name === "duration") {
+                return options.duration === undefined ? NaN : options.duration;
+            }
+            return NaN;
         },
         getFlag(name) {
             return name === "pause" ? Boolean(core.status.paused) : false;
@@ -179,6 +263,7 @@ function loadMainFixture(options = {}) {
             },
             mpv,
             http,
+            file,
             preferences: {
                 get(key) {
                     return Object.prototype.hasOwnProperty.call(prefsStore, key) ? prefsStore[key] : null;
@@ -213,6 +298,8 @@ function loadMainFixture(options = {}) {
         eventHandlers, sidebarHandlers, overlayHandlers, overlayMessages, sidebarMessages, osdMessages,
         clock, xmls, core: context.iina.core,
         context,
+        downloadRequests,
+        segmentFiles,
         get mpvPosition() { return mpvPosition; },
         set mpvPosition(value) { mpvPosition = value; },
         get setClickableCalls() { return setClickableCalls; },
@@ -1326,6 +1413,153 @@ test("drops a stale video detail response after the file changes", async () => {
     assert.deepEqual(fixture.osdMessages, []);
 });
 
+test("sends the logged-in cookie only with danmaku requests", async () => {
+    const sessdata = "abc123%2C1700000000%2Cxyz789";
+    const seen = [];
+    const fixture = loadMainFixture({
+        settings: { sessdata },
+        httpGet(url, request) {
+            seen.push({ url, headers: request.headers || {} });
+            return undefined;
+        }
+    });
+    await fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
+    await wait(0);
+
+    const view = seen.find((entry) => entry.url.includes("/x/web-interface/view"));
+    const danmaku = seen.find((entry) => entry.url.includes("/x/v1/dm/list.so"));
+    assert.ok(view && danmaku, "both video and danmaku requests were made");
+    assert.equal(view.headers.Cookie, undefined, "video info stays anonymous");
+    assert.equal(danmaku.headers.Cookie, "SESSDATA=" + sessdata);
+    assert.equal(danmaku.headers.Referer, "https://www.bilibili.com");
+    assert.equal(fixture.downloadRequests[0].request.headers.Cookie,
+        "SESSDATA=" + sessdata, "segment requests reuse the danmaku cookie");
+    assert.equal(fixture.overlayMessages.every((message) =>
+        !JSON.stringify(message.data || {}).includes("SESSDATA") &&
+        !JSON.stringify(message.data || {}).includes(sessdata)
+    ), true, "credential never reaches the overlay");
+});
+
+test("merges anonymous segment samples into the loaded XML", async () => {
+    const poolXml = '<i><d p="1,1,25,16777215,1700000000,0,aaaa,111">pool</d></i>';
+    const segmentOne = danmakuSegmentBytes([
+        { progress: 1500, mode: 4, fontsize: 25, color: 255, midHash: "bbbb",
+            content: "new <danmaku> & more", ctime: 1700000001, pool: 0, idStr: "222" },
+        { progress: 2000, mode: 1, fontsize: 25, color: 16777215, midHash: "cccc",
+            content: "duplicate", ctime: 1700000002, pool: 0, idStr: "111" },
+        { progress: 2500, mode: 7, fontsize: 25, color: 16777215, midHash: "dddd",
+            content: "advanced", ctime: 1700000003, pool: 0, idStr: "333" }
+    ]);
+    const fixture = loadMainFixture({
+        xmls: [poolXml],
+        duration: 360,
+        httpDownload(url, destination, request) {
+            if (request.params.segment_index === "1") return segmentOne;
+            return new Uint8Array(0);
+        }
+    });
+
+    await fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
+    await wait(10);
+
+    const xml = mergedChunks(fixture);
+    assert.ok(xml.includes('222">new &lt;danmaku&gt; &amp; more</d>'),
+        "segment sample is merged with escaped content");
+    assert.equal(xml.includes("duplicate"), false, "dmid already in the pool is skipped");
+    assert.equal(xml.includes("advanced"), false, "unrenderable modes are dropped");
+
+    const output = [];
+    const parser = createStreamingParser((batch) => output.push(...batch), 200);
+    parser.push(xml);
+    parser.finish();
+    assert.deepEqual(parser.stats(), { parsed: 2, accepted: 2, skipped: 0 });
+
+    assert.equal(fixture.downloadRequests.length, 1);
+    assert.equal(fixture.downloadRequests[0].url,
+        "https://api.bilibili.com/x/v2/dm/web/seg.so");
+    assert.equal(fixture.downloadRequests[0].request.params.oid, "1");
+    assert.equal(fixture.downloadRequests[0].request.params.segment_index, "1");
+    assert.equal(fixture.downloadRequests[0].request.headers.Referer,
+        "https://www.bilibili.com");
+    assert.equal(fixture.segmentFiles.size, 0, "temporary segment files are cleaned up");
+});
+
+test("keeps the pool XML when segment downloads fail", async () => {
+    const poolXml = '<i><d p="1,1,25,16777215,1700000000,0,aaaa,111">pool</d></i>';
+    const fixture = loadMainFixture({
+        xmls: [poolXml],
+        duration: 720,
+        httpDownload() {
+            throw new Error("segment endpoint down");
+        }
+    });
+
+    await fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
+    await wait(10);
+
+    assert.equal(mergedChunks(fixture), poolXml);
+});
+
+test("stops segment probing at the first empty segment when duration is unknown", async () => {
+    const segmentOne = danmakuSegmentBytes([
+        { progress: 1000, mode: 1, fontsize: 25, color: 16777215, midHash: "hhhh",
+            content: "extra", ctime: 1700000010, pool: 0, idStr: "999" }
+    ]);
+    const fixture = loadMainFixture({
+        httpDownload(url, destination, request) {
+            if (request.params.segment_index === "1") return segmentOne;
+            return new Uint8Array(0);
+        }
+    });
+
+    await fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
+    await wait(10);
+
+    assert.equal(fixture.downloadRequests.length, 2, "probing stopped after the empty segment");
+    assert.ok(mergedChunks(fixture).includes(',999">extra</d>'));
+});
+
+test("keeps the pool XML when a segment response is truncated", async () => {
+    const poolXml = '<i><d p="1,1,25,16777215,1700000000,0,aaaa,111">pool</d></i>';
+    // Top-level field 1 declares 5 payload bytes but only 2 are present: a
+    // malformed length must never make the parser loop forever.
+    const truncated = Uint8Array.from([0x0a, 0x05, 0x10, 0x80]);
+    const fixture = loadMainFixture({
+        xmls: [poolXml],
+        duration: 360,
+        httpDownload(url, destination, request) {
+            return request.params.segment_index === "1" ? truncated : new Uint8Array(0);
+        }
+    });
+
+    await fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
+    await wait(10);
+
+    assert.equal(mergedChunks(fixture), poolXml);
+});
+
+test("appends merged danmaku when the pool XML has no closing tag", async () => {
+    const poolXml = '<i><d p="1,1,25,16777215,1700000000,0,aaaa,111">pool</d>';
+    const segmentOne = danmakuSegmentBytes([
+        { progress: 1000, mode: 1, fontsize: 25, color: 16777215, midHash: "hhhh",
+            content: "extra", ctime: 1700000010, pool: 0, idStr: "999" }
+    ]);
+    const fixture = loadMainFixture({
+        xmls: [poolXml],
+        duration: 360,
+        httpDownload(url, destination, request) {
+            return request.params.segment_index === "1" ? segmentOne : new Uint8Array(0);
+        }
+    });
+
+    await fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
+    await wait(10);
+
+    const xml = mergedChunks(fixture);
+    assert.equal(xml.startsWith(poolXml), true);
+    assert.ok(xml.includes(',999">extra</d>'));
+});
+
 test("drops stale danmaku XML after the file changes", async () => {
     const response = deferred();
     const fixture = loadMainFixture({
@@ -1959,7 +2193,7 @@ test("normalizes saved settings types, ranges and unknown keys", () => {
         enabled: true, showTop: false, showBottom: true, fontSize: 36,
         opacity: 0, speed: 1200, offset: -30, fontFamily: "toString",
         strokeColor: "#000000", strokeWidth: 3,
-        autoLoadBangumi: false, autoLoadVideo: false
+        autoLoadBangumi: false, autoLoadVideo: false, sessdata: ""
     });
     assert.ok(fixture.savedSettings, "stale stored values trigger migration write-back");
     assert.equal(fixture.savedSettings.fontSize, 36);
@@ -1987,6 +2221,38 @@ test("normalizes saved settings types, ranges and unknown keys", () => {
         const normalized = currentSettings(loadMainFixture({ settings: { strokeColor: invalid } }));
         assert.equal(normalized.strokeColor, "#000000");
     }
+});
+
+test("normalizes the stored login cookie", () => {
+    const valid = "abc123%2C1700000000%2Cxyz789";
+    const settings = currentSettings(loadMainFixture({
+        settings: { sessdata: "  " + valid + "  " }
+    }));
+    assert.equal(settings.sessdata, valid, "trimmed credential is kept");
+});
+
+test("rejects malformed login cookies instead of persisting them raw", () => {
+    for (const invalid of [
+        null, undefined, 2, true, {}, [],
+        "", "   ", "a;b", "a\nb", "a\rb", 'a"b', "a\\b", "a b",
+        "a".repeat(301)
+    ]) {
+        const normalized = currentSettings(loadMainFixture({ settings: { sessdata: invalid } }));
+        assert.equal(normalized.sessdata, "", JSON.stringify(invalid));
+    }
+    const trimmed = currentSettings(loadMainFixture({
+        settings: { sessdata: "  abc123%2C1700000000%2Cxyz789  " }
+    }));
+    assert.equal(trimmed.sessdata, "abc123%2C1700000000%2Cxyz789");
+});
+
+test("clears the stored login cookie when a patch submits an empty value", () => {
+    const fixture = loadMainFixture({
+        settings: { sessdata: "abc123%2C1700000000%2Cxyz789" }
+    });
+    fixture.sidebarHandlers["update-settings"]({ patch: { sessdata: "" } });
+    assert.equal(fixture.savedSettings.sessdata, "");
+    assert.equal(currentSettings(fixture).sessdata, "");
 });
 
 test("normalizes patches before persisting and restoring settings", () => {
@@ -2062,7 +2328,7 @@ test("migrates full default settings when nothing was stored yet", () => {
         enabled: true, showTop: true, showBottom: true, fontSize: 25,
         fontFamily: "system", strokeWidth: 1, strokeColor: "#000000",
         opacity: 100, speed: 680, offset: 0,
-        autoLoadBangumi: false, autoLoadVideo: false
+        autoLoadBangumi: false, autoLoadVideo: false, sessdata: ""
     });
     assert.equal(fixture.preferenceSyncCalls, 1);
 });
@@ -2072,7 +2338,7 @@ test("skips the migration save when stored settings are complete and valid", () 
         enabled: true, showTop: true, showBottom: true,
         fontSize: 25, fontFamily: "PingFang SC", strokeWidth: 1.5,
         strokeColor: "#123abc", opacity: 80, speed: 680, offset: 0,
-        autoLoadBangumi: false, autoLoadVideo: false
+        autoLoadBangumi: false, autoLoadVideo: false, sessdata: ""
     };
     const fixture = loadMainFixture({ settings: full });
     assert.equal(fixture.savedSettings, null);

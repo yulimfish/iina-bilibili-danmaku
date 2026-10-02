@@ -5,7 +5,7 @@
 // M3: bangumi channel — search / ep-ss-md links -> seasons -> episodes -> cid.
 // M4: danmaku controls — toggle / font / opacity / speed / offset / clear.
 
-const { core, console, menu, sidebar, overlay, event, mpv, http, preferences, utils } = iina;
+const { core, console, menu, sidebar, overlay, event, mpv, http, file, preferences, utils } = iina;
 
 const TAG = "[bili-danmaku]";
 const BILI_HEADERS = {
@@ -203,11 +203,31 @@ const DEFAULT_SETTINGS = {
     speed: 680, // CCL scroll baseline; larger = faster
     offset: 0, // seconds added to playback position
     autoLoadBangumi: false,
-    autoLoadVideo: false
+    autoLoadVideo: false,
+    sessdata: "" // user's own Bilibili login cookie (SESSDATA value only)
 };
 
 const FONT_FAMILY_SANITIZER = /^[^;{}()<>\\",'\r\n]+$/;
 const FONT_FAMILY_MAX_LENGTH = 60;
+
+// SESSDATA is a URL-encoded token; reject anything that would break the
+// Cookie header instead of escaping it silently.
+const SESSDATA_SANITIZER = /^[^;{}()<>\\",'\s]+$/;
+const SESSDATA_MIN_LENGTH = 5;
+const SESSDATA_MAX_LENGTH = 300;
+const SESSDATA_PREFIX = /^SESSDATA=/i;
+
+function sanitizeSessdata(value) {
+    if (typeof value !== "string") {
+        return "";
+    }
+    const trimmed = value.trim().replace(SESSDATA_PREFIX, "").trim();
+    if (trimmed.length < SESSDATA_MIN_LENGTH || trimmed.length > SESSDATA_MAX_LENGTH ||
+        !SESSDATA_SANITIZER.test(trimmed)) {
+        return "";
+    }
+    return trimmed;
+}
 
 let settings = Object.assign({}, DEFAULT_SETTINGS);
 let fonts = null; // installed font families; null = enumeration unavailable
@@ -241,6 +261,8 @@ function normalizeSettings(candidate) {
             if (family !== null) {
                 normalized[key] = family;
             }
+        } else if (key === "sessdata") {
+            normalized[key] = sanitizeSessdata(value);
         } else if (key === "strokeColor") {
             if (typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value)) {
                 normalized[key] = value;
@@ -873,23 +895,294 @@ async function biliApi(path, params, extraHeaders, isStale) {
 }
 
 async function biliDanmakuXml(cid) {
+    const headers = Object.assign({}, BILI_HEADERS);
+    // The danmaku endpoint is semi-anonymous: paid/restricted episodes need a
+    // logged-in cookie, so attach the user's own SESSDATA only when configured.
+    if (settings.sessdata) {
+        headers.Cookie = "SESSDATA=" + settings.sessdata;
+    }
     const res = await http.get("https://api.bilibili.com/x/v1/dm/list.so", {
         params: { oid: String(cid) },
-        headers: BILI_HEADERS,
+        headers: headers,
         data: {}
     });
+    if (res.statusCode === 403) {
+        throw { network: true, status: res.statusCode, loginRequired: true };
+    }
     if (res.statusCode !== 200) {
         throw { network: true, status: res.statusCode };
     }
     return res.text;
 }
 
+// ---------------------------------------------------------------------------
+// Anonymous danmaku enhancement.
+//
+// list.so returns a capped, curated XML pool. seg.so exposes the full segmented
+// pool as protobuf samples, reachable without a login. Fetching a bounded range
+// of segments and merging them into the XML raises the anonymous danmaku count
+// without touching login-only history. Every step is best-effort: any failure
+// falls back to the original XML.
+// ---------------------------------------------------------------------------
+
+const DANMAKU_SEGMENT_SECONDS = 360;
+const DANMAKU_SEGMENT_MAX = 40;
+const DANMAKU_MODES = [1, 2, 4, 5, 6];
+const DANMAKU_SEGMENT_URL = "https://api.bilibili.com/x/v2/dm/web/seg.so";
+
+function readProtobufVarint(bytes, offset) {
+    let value = 0;
+    let shift = 0;
+    let byte = 0;
+    do {
+        if (offset >= bytes.length) {
+            return { value: value, offset: offset };
+        }
+        byte = bytes[offset];
+        offset += 1;
+        value += (byte & 0x7f) * Math.pow(2, shift);
+        shift += 7;
+    } while ((byte & 0x80) !== 0 && shift < 64);
+    return { value: value, offset: offset };
+}
+
+// JavaScriptCore exposes no TextDecoder, so decode UTF-8 by hand.
+function decodeUtf8(bytes, start, end) {
+    let out = "";
+    let i = start;
+    while (i < end) {
+        const first = bytes[i];
+        i += 1;
+        let code;
+        if (first < 0x80) {
+            code = first;
+        } else if ((first & 0xe0) === 0xc0 && i < end) {
+            code = ((first & 0x1f) << 6) | (bytes[i] & 0x3f);
+            i += 1;
+        } else if ((first & 0xf0) === 0xe0 && i + 1 < end) {
+            code = ((first & 0x0f) << 12) | ((bytes[i] & 0x3f) << 6) | (bytes[i + 1] & 0x3f);
+            i += 2;
+        } else if ((first & 0xf8) === 0xf0 && i + 2 < end) {
+            code = ((first & 0x07) << 18) | ((bytes[i] & 0x3f) << 12) |
+                ((bytes[i + 1] & 0x3f) << 6) | (bytes[i + 2] & 0x3f);
+            i += 3;
+        } else {
+            code = 0xfffd;
+        }
+        if (code > 0xffff) {
+            code -= 0x10000;
+            out += String.fromCharCode(0xd800 + (code >> 10), 0xdc00 + (code & 0x3ff));
+        } else {
+            out += String.fromCharCode(code);
+        }
+    }
+    return out;
+}
+
+function parseDanmakuElement(bytes, start, end) {
+    const record = {
+        progress: 0, mode: 0, fontsize: 25, color: 16777215,
+        midHash: "", content: "", ctime: 0, pool: 0, idStr: ""
+    };
+    let offset = start;
+    while (offset < end) {
+        const keyOffset = offset;
+        const key = readProtobufVarint(bytes, offset);
+        offset = key.offset;
+        if (offset <= keyOffset) {
+            break; // malformed input made no progress
+        }
+        const field = Math.floor(key.value / 8);
+        const wire = key.value % 8;
+        if (wire === 0) {
+            const scalar = readProtobufVarint(bytes, offset);
+            offset = scalar.offset;
+            if (offset <= keyOffset) {
+                break;
+            }
+            if (field === 2) record.progress = scalar.value;
+            else if (field === 3) record.mode = scalar.value;
+            else if (field === 4) record.fontsize = scalar.value;
+            else if (field === 5) record.color = scalar.value;
+            else if (field === 8) record.ctime = scalar.value;
+            else if (field === 11) record.pool = scalar.value;
+        } else if (wire === 2) {
+            const len = readProtobufVarint(bytes, offset);
+            offset = len.offset;
+            const stop = Math.min(offset + len.value, end);
+            if (field === 6) record.midHash = decodeUtf8(bytes, offset, stop);
+            else if (field === 7) record.content = decodeUtf8(bytes, offset, stop);
+            else if (field === 12) record.idStr = decodeUtf8(bytes, offset, stop);
+            offset = stop;
+        } else if (wire === 5) {
+            offset = Math.min(offset + 4, end);
+        } else if (wire === 1) {
+            offset = Math.min(offset + 8, end);
+        } else {
+            break;
+        }
+    }
+    return record;
+}
+
+function parseDanmakuSegment(bytes) {
+    const records = [];
+    if (!bytes || bytes.length === 0) {
+        return records;
+    }
+    let offset = 0;
+    while (offset < bytes.length) {
+        const keyOffset = offset;
+        const key = readProtobufVarint(bytes, offset);
+        offset = key.offset;
+        if (offset <= keyOffset) {
+            break; // malformed input made no progress
+        }
+        const field = Math.floor(key.value / 8);
+        const wire = key.value % 8;
+        if (field === 1 && wire === 2) {
+            const len = readProtobufVarint(bytes, offset);
+            offset = len.offset;
+            const stop = Math.min(offset + len.value, bytes.length);
+            records.push(parseDanmakuElement(bytes, offset, stop));
+            offset = stop;
+        } else if (wire === 2) {
+            const len = readProtobufVarint(bytes, offset);
+            offset = Math.min(len.offset + len.value, bytes.length);
+        } else if (wire === 0) {
+            offset = readProtobufVarint(bytes, offset).offset;
+        } else if (wire === 5) {
+            offset = Math.min(offset + 4, bytes.length);
+        } else if (wire === 1) {
+            offset = Math.min(offset + 8, bytes.length);
+        } else {
+            break;
+        }
+    }
+    return records;
+}
+
+function escapeXmlText(text) {
+    return String(text)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+}
+
+function danmakuRecordToXml(record) {
+    const time = (record.progress / 1000).toFixed(3);
+    return '<d p="' + time + "," + record.mode + "," + record.fontsize + "," +
+        record.color + "," + record.ctime + "," + record.pool + "," +
+        escapeXmlText(record.midHash) + "," + escapeXmlText(record.idStr) + '">' +
+        escapeXmlText(record.content) + "</d>";
+}
+
+function mergeDanmakuRecords(xml, records) {
+    const existing = new Set();
+    const pattern = /<d p="([^"]*)"/g;
+    let match;
+    while ((match = pattern.exec(xml)) !== null) {
+        const parts = match[1].split(",");
+        if (parts.length > 7) {
+            existing.add(parts[7]);
+        }
+    }
+    let appended = "";
+    for (const record of records) {
+        if (!record.idStr || !record.content) {
+            continue;
+        }
+        if (DANMAKU_MODES.indexOf(record.mode) === -1) {
+            continue;
+        }
+        if (existing.has(record.idStr)) {
+            continue;
+        }
+        existing.add(record.idStr);
+        appended += danmakuRecordToXml(record);
+    }
+    if (!appended) {
+        return xml;
+    }
+    const close = xml.lastIndexOf("</i>");
+    if (close === -1) {
+        return xml + appended;
+    }
+    return xml.slice(0, close) + appended + xml.slice(close);
+}
+
+async function downloadDanmakuSegment(cid, index, headers) {
+    const destination = "@tmp/bili-danmaku-seg-" + index + "-" + Date.now() + ".so";
+    let bytes = new Uint8Array(0);
+    try {
+        await http.download(DANMAKU_SEGMENT_URL, destination, {
+            params: { oid: String(cid), segment_index: String(index), type: "1" },
+            headers: headers,
+            method: "GET"
+        });
+        const handle = file.handle(destination, "read");
+        if (handle) {
+            const data = handle.readToEnd();
+            if (data) {
+                bytes = data;
+            }
+            handle.close();
+        }
+    } catch (e) {
+        bytes = new Uint8Array(0);
+    } finally {
+        try {
+            file.delete(destination);
+        } catch (e) {
+            // The temporary segment is best-effort cleanup.
+        }
+    }
+    return bytes;
+}
+
+async function enhanceDanmakuWithSegments(cid, xml) {
+    try {
+        const headers = Object.assign({}, BILI_HEADERS);
+        if (settings.sessdata) {
+            headers.Cookie = "SESSDATA=" + settings.sessdata;
+        }
+        const duration = mpv.getNumber("duration");
+        const bounded = isFinite(duration) && duration > 0;
+        const count = bounded
+            ? Math.min(Math.ceil(duration / DANMAKU_SEGMENT_SECONDS), DANMAKU_SEGMENT_MAX)
+            : DANMAKU_SEGMENT_MAX;
+        const records = [];
+        for (let index = 1; index <= count; index += 1) {
+            const bytes = await downloadDanmakuSegment(cid, index, headers);
+            if (!bytes || bytes.length === 0) {
+                // Without a duration we can only probe until the pool runs dry.
+                if (!bounded) {
+                    break;
+                }
+                continue;
+            }
+            const parsed = parseDanmakuSegment(bytes);
+            for (const record of parsed) {
+                records.push(record);
+            }
+        }
+        if (records.length === 0) {
+            return xml;
+        }
+        return mergeDanmakuRecords(xml, records);
+    } catch (e) {
+        console.log(TAG + " segment enhance skipped: " + (e && e.message ? e.message : e));
+        return xml;
+    }
+}
+
 function reportError(e) {
     let msg = "网络请求失败，请检查网络后重试";
     if (e && (e.biliCode === -404 || e.biliCode === 62002)) {
         msg = "视频不存在或不可见（BV 号无效、视频已删除或仅自己可见）";
-    } else if (e && e.biliCode === -403) {
-        msg = "访问被拒绝（可能为地区/权限限制）";
+    } else if (e && (e.biliCode === -403 || e.loginRequired)) {
+        msg = "访问被拒绝（可能为地区/权限限制，或需要大会员登录态）";
     } else if (e && e.biliCode === -412) {
         msg = "请求被 B 站风控拦截，稍后重试";
     } else if (e && e.biliCode) {
@@ -929,7 +1222,11 @@ async function loadPart(index, loadState, streamMetadata) {
     if (!isCurrentLoad(loadState)) {
         return; // superseded by a newer load
     }
-    pushToOverlay(xml, streamMetadata);
+    const mergedXml = await enhanceDanmakuWithSegments(cid, xml);
+    if (!isCurrentLoad(loadState)) {
+        return; // superseded by a newer load
+    }
+    pushToOverlay(mergedXml, streamMetadata);
     pushPartsToSidebar();
     if (!streamMetadata || streamMetadata.origin !== "auto") {
         core.osd("已切换到「" + video.title + "」" + label);
