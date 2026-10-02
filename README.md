@@ -75,7 +75,7 @@ CommentCoreLibrary：渐进渲染，活动上限 240
 
 ## 本版变化
 
-详见 [v0.3.0 发布说明](docs/releases/2026-10-02-v0.3.0.md)。
+详见 [v0.3.0 发布说明](docs/releases/2026-10-03-v0.3.0.md)。
 
 ## 开发验证
 
