@@ -96,6 +96,7 @@ function loadMainFixture(options = {}) {
     const osdMessages = [];
     const clock = { now: 0 };
     let setClickableCalls = 0;
+    let overlayPageReady = false;
     let savedSettings = null;
     let preferenceSyncCalls = 0;
     let mpvPosition = options.mpvPosition === undefined
@@ -124,6 +125,7 @@ function loadMainFixture(options = {}) {
     };
     const overlay = {
         loadFile() {
+            overlayPageReady = true;
             setTimeout(() => {
                 if (eventHandlers["iina.plugin-overlay-loaded"]) {
                     eventHandlers["iina.plugin-overlay-loaded"]();
@@ -134,7 +136,7 @@ function loadMainFixture(options = {}) {
         postMessage(name, data) {
             overlayMessages.push({ name, data });
             if (name === "ping" && overlayHandlers["overlay-ready"] &&
-                options.manualOverlayReady !== true) {
+                overlayPageReady && options.manualOverlayReady !== true) {
                 overlayHandlers["overlay-ready"]({});
             } else if (name === "stream-chunk" && options.autoAcknowledgeChunks !== false) {
                 setTimeout(() => {
@@ -302,6 +304,13 @@ function loadMainFixture(options = {}) {
         segmentFiles,
         get mpvPosition() { return mpvPosition; },
         set mpvPosition(value) { mpvPosition = value; },
+        simulateOverlayReload() { overlayPageReady = false; },
+        finishOverlayReload() {
+            overlayPageReady = true;
+            if (eventHandlers["iina.plugin-overlay-loaded"]) {
+                eventHandlers["iina.plugin-overlay-loaded"]();
+            }
+        },
         get setClickableCalls() { return setClickableCalls; },
         get savedSettings() { return savedSettings; },
         get preferenceSyncCalls() { return preferenceSyncCalls; },
@@ -1372,6 +1381,29 @@ test("clears the sidebar source state after end-file", () => {
     const state = fixture.sidebarMessages.filter((message) => message.name === "state").at(-1);
     assert.equal(state.data.loaded, false);
     assert.equal(state.data.status, "idle");
+});
+
+test("waits for the overlay to reload before streaming the next file", async () => {
+    const fixture = loadMainFixture();
+    await fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
+    await wait(5);
+    assert.equal(fixture.overlayMessages.filter((message) => message.name === "stream-start").length, 1);
+
+    fixture.simulateOverlayReload();
+    fixture.eventHandlers["mpv.end-file"]({ reason: "eof" });
+    fixture.eventHandlers["iina.file-loaded"]("file:///tmp/next-file.mp4");
+    await fixture.sidebarHandlers["load-source"]({ text: "BV1xx411c7mD" });
+    await wait(5);
+
+    assert.equal(fixture.overlayMessages.filter((message) => message.name === "stream-start").length, 1);
+    fixture.finishOverlayReload();
+    await wait(5);
+
+    const streams = fixture.overlayMessages.filter((message) => message.name === "stream-start");
+    assert.equal(streams.length, 2);
+    assert.ok(fixture.overlayMessages.some((message) =>
+        message.name === "stream-chunk" && message.data.streamId === streams[1].data.streamId
+    ));
 });
 
 test("reports asynchronous recognition failures without an unhandled rejection", async () => {

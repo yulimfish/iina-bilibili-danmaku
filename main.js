@@ -846,6 +846,12 @@ function handleFileLoaded(data) {
     currentFileIdentity = identity;
     fileGeneration += 1;
     invalidateFileLoads();
+    if (overlayRequested) {
+        overlayLoaded = false;
+        if (overlayMessagesRegistered) {
+            overlay.postMessage("ping", {});
+        }
+    }
     const generation = fileGeneration;
     const recognitionSearchGeneration = searchGeneration;
     currentFileContextState = { context: context, generation: generation };
